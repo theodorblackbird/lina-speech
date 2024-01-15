@@ -1,0 +1,9 @@
+# torch >= 2.1
+pytorch_lightning
+mamba-ssm
+einops
+vocos
+encodec
+phonemizer
+polars
+rotary-embedding-torch
