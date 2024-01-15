@@ -1,3 +1,5 @@
+# Adapted from  https://github.com/SmerkyG/gptcore
+
 from dataclasses import dataclass
 from typing import Optional
 
