@@ -9,7 +9,7 @@ Consider this as highly experimental and subject to many changes in the near fut
 
 ### Samples
 
-Mamba model (60M parameters) :
+Mamba based (60M parameters) :
 
 https://theodorblackbird.github.io/blog/demo_alpha/
 
