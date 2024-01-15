@@ -1,5 +1,6 @@
 # torch >= 2.1
 pytorch_lightning
+causal-conv1d>=1.1.0
 mamba-ssm
 einops
 vocos
