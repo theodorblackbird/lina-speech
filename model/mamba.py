@@ -1,3 +1,4 @@
+# adapted from https://github.com/state-spaces/mamba
 import math
 from collections import namedtuple
 from functools import partial
