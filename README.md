@@ -31,3 +31,5 @@ Soon
 
 This work takes place at IRCAM, and is part of the following project :
 [ANR Exovoices](https://anr.fr/Projet-ANR-21-CE23-0040)
+
+<img align="left" width="200" height="200" src="logo_ircam.jpeg">
