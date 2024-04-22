@@ -1,4 +1,3 @@
-# adapted from https://github.com/state-spaces/mamba
 import math
 from collections import namedtuple
 from functools import partial
@@ -154,9 +153,10 @@ class MixerModel(nn.Module):
         # hidden_states = self.embedding(input_ids)
         residual = None
         for layer in self.layers:
-            hidden_states, residual = layer(
-                hidden_states, residual, inference_params=inference_params
-            )
+            hidden_states, residual = torch.utils.checkpoint.checkpoint(layer, hidden_states, residual, inference_params=inference_params, use_reentrant=False)
+            #layer(
+            #    hidden_states, residual, inference_params=inference_params
+            #)
             residual = torch.nn.functional.dropout(
                 residual, p=self.dropout, training=self.training
             )
@@ -208,7 +208,7 @@ class MambaLMModel(nn.Module, GenerationMixin):
             **backbone_kwargs,
             **factory_kwargs,
         )
-        self.lm_head = nn.Linear(d_model, vocab_size, bias=False, **factory_kwargs)
+       # self.lm_head = nn.Linear(d_model, vocab_size, bias=False, **factory_kwargs)
 
         # Initialize weights and apply final processing
         self.apply(
@@ -220,8 +220,8 @@ class MambaLMModel(nn.Module, GenerationMixin):
         )
         # self.tie_weights()
 
-    def tie_weights(self):
-        self.lm_head.weight = self.backbone.embedding.weight
+    #def tie_weights(self):
+    #    self.lm_head.weight = self.backbone.embedding.weight
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return self.backbone.allocate_inference_cache(
@@ -257,19 +257,20 @@ def exists(x):
 class AttentiveMamba(AttentiveRNN):
     def __init__(
         self,
-        d_model,
-        n_layer,
-        d_context,
-        heads,
-        dropout_att=0.0,
-        blind=False,
+        d_model: int,
+        n_layer: int,
+        d_context: int,
+        heads: int,
+        dropout_att: float=0.0,
+        blind: bool=False,
+        d_blind: int=64
     ):
         super().__init__()
         self.encoder = MambaLMModel(d_model, n_layer)
         self.decoder = MambaLMModel(d_model, n_layer)
         self.cross_att = (
             BlindCrossAttention(
-                d_model, d_context, d_model, heads, MambaLMModel(64, 1), dropout_att
+                d_model, d_context, d_model, heads, MambaLMModel(d_blind, 2), dropout_att, pos_dim=d_blind
             )
             if blind
             else CrossAttention(d_model, d_context, d_model, heads, dropout_att)
@@ -284,9 +285,11 @@ class AttentiveMamba(AttentiveRNN):
         else:
             mask = None
 
+        #y = torch.utils.checkpoint.checkpoint(self.encoder, x, use_reentrant=False)
         y = self.encoder(x)
         v, att = self.cross_att(y, ctx, mask=mask)
         y = self.decoder(y + v)
+        #y = torch.utils.checkpoint.checkpoint(self.decoder, y + v, use_reentrant=False)
         return y, att
 
     def init_state(self, max_seqlen=1000):

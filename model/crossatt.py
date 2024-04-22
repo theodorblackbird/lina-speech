@@ -81,30 +81,25 @@ class BlindCrossAttention(nn.Module):
                 k = self.rotary.rotate_queries_or_keys(k)
             else:
                 q, k = map(self.rotary.rotate_queries_or_keys, (q, k))
-
-        if self.training:
+        if mask is not None:
             mask = mask.masked_fill(~mask, -torch.finfo(q.dtype).max)
-            x = nn.functional.scaled_dot_product_attention(
+        if self.training:
+            sdpa = lambda q, k, pos: (nn.functional.scaled_dot_product_attention(
                 q, k, pos, attn_mask=mask, dropout_p=self.dropout_att.p
-            )
-            att = None
-
-            x = rearrange(x, "b 1 n d -> b n d")
-            x = self.pos_net(x)
-            x = rearrange(x, "b n d -> b 1 n d")
-            x = nn.functional.scaled_dot_product_attention(x, rearrange(pos, "n d -> 1 1 n d"), v, attn_mask=mask)
-            x = rearrange(x, "b 1 n d -> b n d")
+                ), None)
         else:
-            x, att = scaled_dot_product_attention(q, k, pos, mask=mask)
-
-            x = rearrange(x, "b 1 n d -> b n d")
-            x = self.pos_net(x, **kwargs)
-            x = rearrange(x, "b n d -> b 1 n d")
-            # mask = mask.masked_fill(~mask, -torch.finfo(q.dtype).max)
-            x, att2 = scaled_dot_product_attention(x, pos, v, mask=mask)
-            att = torch.cat((att, att2), dim=1)
-            x = rearrange(x, "b 1 n d -> b n d")
-
+            sdpa = lambda q, k, pos: scaled_dot_product_attention(q, k, pos, mask=mask)
+        x, att1 = sdpa(q, k, pos)
+        x = rearrange(x, "b 1 n d -> b n d")
+        x = self.pos_net(x, **kwargs)
+        x = rearrange(x, "b n d -> b 1 n d")
+        pos = rearrange(pos, "n d -> 1 1 n d")
+        x, att2 = sdpa(x, pos, v)
+        if att1 is not None:
+            att = torch.cat((att1, att2), dim=1)
+        else:
+            att = None
+        x = rearrange(x, "b 1 n d -> b n d")
         return x, att
 
 
@@ -128,7 +123,7 @@ class CrossAttention(nn.Module):
         self.ln_k = nn.LayerNorm(att_dim)
         self.ln_v = nn.LayerNorm(att_dim)
         self.rotary = RotaryEmbedding((att_dim // heads) // 2) if rotary else None
-        self.dropout_att = nn.Dropout(dropout)
+        self.dropout_att = dropout
 
     def forward(
         self,
@@ -153,12 +148,11 @@ class CrossAttention(nn.Module):
         if self.training:
             mask = mask.masked_fill(~mask, -torch.finfo(q.dtype).max)
             x = nn.functional.scaled_dot_product_attention(
-                q, k, v, attn_mask=mask, dropout_p=self.dropout_att.p
+                q, k, v, attn_mask=mask, dropout_p=self.dropout_att
             )
             att = None
         else:
             x, att = scaled_dot_product_attention(q, k, v, mask=mask)
-            att = self.dropout_att(att)
         x = rearrange(x, "b h n d -> b n (h d)")
 
         return x, att

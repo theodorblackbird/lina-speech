@@ -5,6 +5,6 @@ mamba-ssm
 einops
 vocos
 encodec
-phonemizer
-polars
 rotary-embedding-torch
+transformers
+jsonargparse[omegaconf]

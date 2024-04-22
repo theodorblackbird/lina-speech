@@ -5,14 +5,50 @@ import torch
 default_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def topk_sampling(seq, k=1, temp=1.0):
-    topk = torch.topk(seq, k)
+def topk_sampling(seq, k=1, temp=1.):
+    topk = torch.topk(seq, k, dim=-1)
     logits = seq / temp
     mask = logits < topk.values[:, [-1]]
-    logits[mask] = -float("Inf")
+    logits[mask]  = -float('Inf')
     probs = torch.softmax(logits, dim=-1)
     return torch.multinomial(probs, num_samples=1)
 
+def delay_rvq(
+    code,
+    head_token: int = -2,
+    tail_token: int = -3,
+):
+    q, _ = code.shape
+    extension = torch.ones((q, q + 1)).tril() * head_token
+    extension += torch.ones((q + 1, q)).tril(diagonal=-1).T * tail_token
+    extension = torch.flip(extension, (1,))
+    extended_code = torch.cat((code, extension), axis=1)
+    for i in range(q):
+        extended_code[i, :] = torch.roll(extended_code[i, :], i + 1)
+
+    return extended_code.long()
+
+
+def undelay_rvq(extended_code):
+    q, _, n = extended_code.shape
+    out = []
+    for i in range(q):
+        out.append(torch.roll(extended_code[i], -(i + 1), dims=1))
+    out = torch.stack(out, dim=0)
+    return out[:, :, :-(q+1)]
+
+def to_vocos(x):
+    x = undelay_rvq(x.T)
+    x = (x - 3).clamp_min(0)
+    return x
+
+def txt_to_phon(x):
+    return espeak.phonemize([x], strip=True, njobs=1)[0]
+    
+def phon_to_code(x):
+    y = [ds.vocab_x_code[t] for t in x]
+    y = [ds.vocab_x_code["BOS"]] + y + [ds.vocab_x_code["EOS"]]
+    return torch.tensor(y)
 
 def sequence_mask(lengths, max_len=None, device=default_device):
     batch_size = lengths.shape[0]
@@ -40,6 +76,13 @@ def align_mask(src_mask, mel_mask):
         l = torch.max(mel.sum(-1))
         align_mask[i, :w, :l] = torch.ones(w, l, dtype=torch.bool)
     return align_mask
+
+
+def last_that_fullfil(cond: Callable, x: torch.Tensor, strict: bool = True):
+    res = cond(x).nonzero()
+    if strict:
+        assert len(res), f"no one fullfill {cond}"
+    return res[-1]
 
 
 def first_that_fullfil(cond: Callable, x: torch.Tensor, strict: bool = True):

@@ -1,8 +1,6 @@
-# Adapted from  https://github.com/SmerkyG/gptcore
-
 from dataclasses import dataclass
 from typing import Optional
-
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,298 +8,318 @@ from torch import Tensor
 
 from model.attentive_rnn import AttentiveRNN
 from model.crossatt import BlindCrossAttention, CrossAttention
-from model.gptblock import GPTBlock
+from model.base_blocks import MixingBlock, SwiGLU
 from model.rwkv_inner import rwkv_inner
 from einops import rearrange
+from fla.ops.gla import fused_chunk_gla
+
+from torch.utils.cpp_extension import load
 
 
+#adapted from https://github.com/BlinkDL/RWKV-LM/blob/main/RWKV-v5/src/model.py
 
-class RWKVConfig:
-    def __init__(self, hparams):
-        super().__init__()
-        self.n_embd = hparams.d_model
-        self.n_head = hparams.n_head
-        self.n_kv_head = int(hparams.n_head * hparams.n_kv_head_ratio)
-        self.n_layer = hparams.n_layer
-        self.dim_ffn = int(hparams.feedforward_d_model_ratio * hparams.d_model)
-        self.dim_rk = int(hparams.d_qk_ratio * hparams.d_model)
-        self.dim_v = int(hparams.d_v_ratio * hparams.d_model)
-        self.ctx_len = hparams.max_sequence_length
-        self.head_size_divisor = 8
+def __noop(ob):
+    return ob
 
-# version without u 'bonus' term
-def rwkv6_0_simple_recurrent(r_in, k_in, v_in, w_in, kv_state):
-    B,H,L,K = r_in.shape
-    V = v_in.size(-1)
-    out = []
-    for t in range(L):
-        r, k, v, w = r_in[...,t:t+1,:], k_in[...,t:t+1,:], v_in[...,t:t+1,:], w_in[...,t:t+1,:]
-        kv_state = (w.mT * kv_state) + k.mT @ v # KV
-        out.append( r @ kv_state ) # 1K @ KV -> 1V
-    out = torch.cat(out, dim=-2)
-    return out, kv_state
 
-# version including u 'bonus' term
-def rwkv6_0_recurrent(r_in, k_in, v_in, w_in, u, kv_state):
-    B,H,L,K = r_in.shape
-    V = v_in.size(-1)
-    L = r_in.size(-2)
-    out = []
-    for t in range(L):
-        r, k, v, w = r_in[...,t:t+1,:], k_in[...,t:t+1,:], v_in[...,t:t+1,:], w_in[...,t:t+1,:]
-        kv = k.mT @ v # KV
-        out.append( r @ (kv_state + u.mT * kv) ) # 1K @ KV -> 1V
-        kv_state = (w.mT * kv_state) + kv # KV
-    out = torch.cat(out, dim=-2)
-    return out, kv_state
+MyFunction = __noop
 
-def sanity_check():
-    torch.manual_seed(1337)
-    
-    T = 9
-    B = 1
-    H = 1
-    K,V = 3,5
-    r = torch.rand(B,H,T,K)
-    k = torch.rand(B,H,T,K)
-    v = torch.rand(B,H,T,V)
-    w = torch.rand(1,H,T,K).expand(B,H,T,K)
-    u = torch.rand(1,H,1,K)
-    kv_state = torch.zeros(B,H,K,V,device=v.device,dtype=v.dtype)
 
-    precision_dtype, precision_min_val = torch.float32, 0.02 # good for fp32 
-    #precision_dtype, precision_min_val = torch.float64, 1e-10 # good for fp64   
-    w = w.clamp(precision_min_val)
-
-    # recurrent
-    out, _ = rwkv6_0_recurrent(r,k,v,w,u,kv_state)
-    print(out)
-
-    # parallel
-    out, _ = rwkv_inner(r,k,v,w,u,kv_state,chunk_len=3)
-    print(out)
-
-if __name__ == "__main__":
-    sanity_check()
-    exit()
-
-class RWKV6_0_AttentionSubLayer(nn.Module):
-    def __init__(self, hparams, layer_id):
-        super().__init__()
-
-        args = RWKVConfig(hparams)
-
-        self.args = args
-        self.layer_id = layer_id
-        self.ctx_len = args.ctx_len
-        self.n_embd = args.n_embd
-
-        self.n_head = args.n_head
-        self.n_kv_head = args.n_kv_head
-        self.r_head_size = args.dim_rk // args.n_head
-        self.k_head_size = args.dim_rk // args.n_head
-        self.v_head_size = args.dim_v // args.n_head
-        assert args.dim_rk % self.n_head == 0
-        assert args.dim_rk % self.n_kv_head == 0
-        assert args.dim_v % self.n_kv_head == 0
-
+class WKV_6(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, B, T, C, H, r, k, v, w, u):
         with torch.no_grad():
-            ratio_0_to_1 = layer_id / max(args.n_layer - 1, 1)  # 0 to 1
-            ratio_1_to_almost0 = 1.0 - (layer_id / args.n_layer)  # 1 to ~0
-            ddd = torch.ones(1, 1, args.n_embd)
-            for i in range(args.n_embd):
-                ddd[0, 0, i] = i / args.n_embd
+            assert r.dtype == torch.bfloat16
+            assert k.dtype == torch.bfloat16
+            assert v.dtype == torch.bfloat16
+            assert w.dtype == torch.bfloat16
+            assert u.dtype == torch.bfloat16
+            assert HEAD_SIZE == C // H
+            ctx.B = B
+            ctx.T = T
+            ctx.C = C
+            ctx.H = H
+            assert r.is_contiguous()
+            assert k.is_contiguous()
+            assert v.is_contiguous()
+            assert w.is_contiguous()
+            assert u.is_contiguous()
+            ew = (-torch.exp(w.float())).contiguous()
+            ctx.save_for_backward(r, k, v, ew, u)
+            y = torch.empty(
+                (B, T, C),
+                device=r.device,
+                dtype=torch.bfloat16,
+                memory_format=torch.contiguous_format,
+            )  # .uniform_(-100, 100)
+            wkv6_cuda.forward(B, T, C, H, r, k, v, ew, u, y)
+            return y
 
-            self.x_maa = nn.Parameter(1 - torch.pow(ddd, ratio_1_to_almost0))
-            self.r_maa = nn.Parameter(1 - torch.pow(ddd, 0.5 * ratio_1_to_almost0))
-            self.w_maa = nn.Parameter(1 - torch.pow(ddd, ratio_1_to_almost0))
-            self.k_maa = nn.Parameter(1 - torch.pow(ddd, ratio_1_to_almost0))
-            self.v_maa = nn.Parameter(1 - (torch.pow(ddd, ratio_1_to_almost0) + 0.3 * ratio_0_to_1))
-            self.g_maa = nn.Parameter(1 - torch.pow(ddd, 0.5 * ratio_1_to_almost0))
-            TIME_MIX_EXTRA_DIM = 32
-            self.tm_w1 = nn.Parameter(torch.empty(args.n_embd, TIME_MIX_EXTRA_DIM * 5).uniform_(-0.01, 0.01))
-            self.tm_w2 = nn.Parameter(torch.zeros(5, TIME_MIX_EXTRA_DIM, args.n_embd))
-            W_MIX_EXTRA_DIM = 64
-            self.td_w1 = nn.Parameter(torch.empty(args.n_embd, W_MIX_EXTRA_DIM).uniform_(-0.01, 0.01))
-            self.td_w2 = nn.Parameter(torch.zeros(W_MIX_EXTRA_DIM, args.n_embd))
+    @staticmethod
+    def backward(ctx, gy):
+        with torch.no_grad():
+            assert gy.dtype == torch.bfloat16
+            B = ctx.B
+            T = ctx.T
+            C = ctx.C
+            H = ctx.H
+            assert gy.is_contiguous()
+            r, k, v, ew, u = ctx.saved_tensors
+            gr = torch.empty(
+                (B, T, C),
+                device=gy.device,
+                requires_grad=False,
+                dtype=torch.bfloat16,
+                memory_format=torch.contiguous_format,
+            )  # .uniform_(-100, 100)
+            gk = torch.empty(
+                (B, T, C),
+                device=gy.device,
+                requires_grad=False,
+                dtype=torch.bfloat16,
+                memory_format=torch.contiguous_format,
+            )  # .uniform_(-100, 100)
+            gv = torch.empty(
+                (B, T, C),
+                device=gy.device,
+                requires_grad=False,
+                dtype=torch.bfloat16,
+                memory_format=torch.contiguous_format,
+            )  # .uniform_(-100, 100)
+            gw = torch.empty(
+                (B, T, C),
+                device=gy.device,
+                requires_grad=False,
+                dtype=torch.bfloat16,
+                memory_format=torch.contiguous_format,
+            )  # .uniform_(-100, 100)
+            gu = torch.empty(
+                (B, C),
+                device=gy.device,
+                requires_grad=False,
+                dtype=torch.bfloat16,
+                memory_format=torch.contiguous_format,
+            )  # .uniform_(-100, 100)
+            wkv6_cuda.backward(B, T, C, H, r, k, v, ew, u, gy, gr, gk, gv, gw, gu)
+            gu = torch.sum(gu, 0).view(H, C // H)
+            return (None, None, None, None, gr, gk, gv, gw, gu)
+
+
+def RUN_CUDA_RWKV6(B, T, C, H, r, k, v, w, u):
+    return WKV_6.apply(B, T, C, H, r, k, v, w, u)
+
+
+class RWKV_TMix_x060(nn.Module):
+    def __init__(self, d_model, n_head, layer_id, n_layer, head_size_divisor: int=8):
+        super().__init__()
+        self.layer_id = layer_id
+
+        self.head_size = d_model // n_head
+        self.head_size_divisor = head_size_divisor
+        self.n_head = n_head
+        assert d_model % self.n_head == 0
+        global wkv6_cuda
+        wkv6_cuda = load(
+            name="wkv6",
+            sources=["cuda/wkv6_op.cpp", f"cuda/wkv6_cuda.cu"],
+            verbose=True,
+            extra_cuda_cflags=[
+                "-res-usage",
+                "--use_fast_math",
+                "-O3",
+                "-Xptxas -O3",
+                "--extra-device-vectorization",
+                f"-D_N_={self.head_size}",
+                f"-D_T_={int(os.environ['RWKV_CTXLEN'])}",
+            ],
+        )
+        with torch.no_grad():
+            ratio_0_to_1 = layer_id / (n_layer - 1)  # 0 to 1
+            ratio_1_to_almost0 = 1.0 - (layer_id / n_layer)  # 1 to ~0
+            ddd = torch.ones(1, 1, d_model)
+            for i in range(d_model):
+                ddd[0, 0, i] = i / d_model
+
+            # fancy time_mix
+            self.time_maa_x = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0))
+            self.time_maa_w = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0))
+            self.time_maa_k = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0))
+            self.time_maa_v = nn.Parameter(
+                1.0 - (torch.pow(ddd, ratio_1_to_almost0) + 0.3 * ratio_0_to_1)
+            )
+            self.time_maa_r = nn.Parameter(
+                1.0 - torch.pow(ddd, 0.5 * ratio_1_to_almost0)
+            )
+            self.time_maa_g = nn.Parameter(
+                1.0 - torch.pow(ddd, 0.5 * ratio_1_to_almost0)
+            )
+
+            TIME_MIX_EXTRA_DIM = 32  # generate TIME_MIX for w,k,v,r,g
+            self.time_maa_w1 = nn.Parameter(
+                torch.zeros(d_model, TIME_MIX_EXTRA_DIM * 5)
+            )
+            self.time_maa_w2 = nn.Parameter(
+                torch.zeros(5, TIME_MIX_EXTRA_DIM, d_model).uniform_(-0.01, 0.01)
+            )
 
             # fancy time_decay
-            k_dim_att = args.n_kv_head * self.k_head_size
-            decay_speed = torch.ones(k_dim_att)
-            for n in range(k_dim_att):
-                decay_speed[n] = -6 + 5 * (n / max(k_dim_att - 1, 1)) ** (0.7 + 1.3 * ratio_0_to_1)
-            self.time_decay = nn.Parameter(decay_speed.reshape(self.n_kv_head, self.k_head_size)) # (KVH, K)
-            # print(layer_id, self.time_decay.flatten()[:3].cpu().numpy(), '...', self.time_decay.flatten()[-3:].cpu().numpy())
+            decay_speed = torch.ones(d_model)
+            for n in range(d_model):
+                decay_speed[n] = -6 + 5 * (n / (d_model - 1)) ** (
+                    0.7 + 1.3 * ratio_0_to_1
+                )
+            self.time_decay = nn.Parameter(decay_speed.reshape(1, 1, d_model))
 
-            tmp = torch.zeros(k_dim_att)
-            for n in range(k_dim_att):
+            TIME_DECAY_EXTRA_DIM = 64
+            self.time_decay_w1 = nn.Parameter(
+                torch.zeros(d_model, TIME_DECAY_EXTRA_DIM)
+            )
+            self.time_decay_w2 = nn.Parameter(
+                torch.zeros(TIME_DECAY_EXTRA_DIM, d_model).uniform_(-0.01, 0.01)
+            )
+
+            tmp = torch.zeros(d_model)
+            for n in range(d_model):
                 zigzag = ((n + 1) % 3 - 1) * 0.1
-                tmp[n] = ratio_0_to_1 * (1 - (n / max(k_dim_att - 1, 1))) + zigzag
+                tmp[n] = ratio_0_to_1 * (1 - (n / (d_model - 1))) + zigzag
 
-            self.time_first = nn.Parameter(tmp.reshape(self.n_kv_head, self.k_head_size)) # (KVH, K)
+            self.time_faaaa = nn.Parameter(tmp.reshape(self.n_head, self.head_size))
 
         self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
-        self.receptance = nn.Linear(args.n_embd, self.n_head * self.r_head_size, bias=False)
-        self.key = nn.Linear(args.n_embd, self.n_kv_head * self.k_head_size, bias=False)
-        self.value = nn.Linear(args.n_embd, self.n_kv_head * self.v_head_size, bias=False)
-        self.output = nn.Linear(args.dim_v, args.n_embd, bias=False)
-        self.gate = nn.Linear(args.n_embd, args.dim_v, bias=False)
+        self.receptance = nn.Linear(d_model, d_model, bias=False)
+        self.key = nn.Linear(d_model, d_model, bias=False)
 
-        #self.rotary_positional_embedding = hparams.rotary_positional_embedding_factory(hparams.max_sequence_length, int(hparams.d_qk_ratio * hparams.d_model / hparams.n_head))
+        self.value = nn.Linear(d_model, d_model, bias=False)
+        self.output = nn.Linear(d_model, d_model, bias=False)
+        self.gate = nn.Linear(d_model, d_model, bias=False)
+        self.ln_x = nn.GroupNorm(
+            self.n_head, d_model, eps=(1e-5) * (self.head_size_divisor**2)
+        )
 
-        self.ln_x = nn.GroupNorm(self.n_kv_head, args.dim_v)
+    def wkv(self, r, k, v, w):
+            w = torch.exp(-torch.exp(w))
+            r, v, w = map(lambda x: rearrange(x, "b n (h c) -> b h n c", h=self.n_head), (r, v, w))
+            k = rearrange(k, "b n (h c) -> b h c n", h=self.n_head)
+            y = torch.zeros_like(v)
+            b, _, n, _ = r.shape
+            if self.kv_state is None:
+                    self.kv_state = torch.zeros(b, self.n_head, self.head_size, self.head_size, device=r.device).bfloat16()
 
-    def post_init_fn(self, myself):
-        zero = [self.receptance, self.key, self.output]
-        for m in zero:
-            nn.init.zeros_(m.weight)
-        # FIXME - init ln_x with something like layer_scale * 0.7
-        ortho = [self.value, self.gate]
-        for m in ortho:
-            if m.weight.shape[0] > m.weight.shape[1]:
-                gain = math.sqrt(m.weight.shape[0] / m.weight.  shape[1])
-            else:
-                gain = 1.0
-            nn.init.orthogonal_(m.weight, gain=gain)
+            for t in range(n):
+                    rt = r[:, :, [t], :]
+                    kt = k[:, :, :, [t]]
+                    vt = v[:, :, [t], :]
+                    wt = w[:, :, [t]]
+                    kvt =  kt @ vt
+                    ot = rt @ (self.time_faaaa[None, ..., None] * kvt + self.kv_state)
+                    y[:, :, t] = ot.squeeze(2)
+                    self.kv_state = self.kv_state * wt + kvt
 
-    def forward(self, x:  Tensor, recurrent_memory : Optional[Tensor] = None):
+            y = rearrange(y, "b h n c -> b n (h c)")
+            return y
 
-        H = self.n_head
-        KVH = self.n_kv_head
-        R = self.r_head_size
-        K = self.k_head_size
-        V = self.v_head_size
 
+    @MyFunction
+    def jit_func(self, x):
         B, T, C = x.size()
 
-        xx = x
-        sx = self.time_shift(x) - xx
-        #sx = torch.cat((sx.unsqueeze(0), xx[:-1,:])) - xx
+        if self.inference:
+            state = self.state
+            if state is None:
+                state = torch.zeros_like(x)
+        else:
+            state = self.time_shift(x)
 
-        xxx = xx + sx * self.x_maa
-        xxx = torch.tanh(xxx @ self.tm_w1).view(B*T, 5, -1).transpose(0, 1)
-        xxx = torch.bmm(xxx, self.tm_w2).view(5, B, T, -1)
+        xx = state - x
+
+        xxx = x + xx * self.time_maa_x
+        xxx = torch.tanh(xxx @ self.time_maa_w1).view(B * T, 5, -1).transpose(0, 1)
+        xxx = torch.bmm(xxx, self.time_maa_w2).view(5, B, T, -1)
         mw, mk, mv, mr, mg = xxx.unbind(dim=0)
 
-        wx = xx + sx * (self.w_maa + mw)
-        kx = xx + sx * (self.k_maa + mk)
-        vx = xx + sx * (self.v_maa + mv)
-        rx = xx + sx * (self.r_maa + mr)
-        gx = xx + sx * (self.g_maa + mg)
+        xw = x + xx * (self.time_maa_w + mw)
+        xk = x + xx * (self.time_maa_k + mk)
+        xv = x + xx * (self.time_maa_v + mv)
+        xr = x + xx * (self.time_maa_r + mr)
+        xg = x + xx * (self.time_maa_g + mg)
 
-        r = self.receptance(rx).view(B, T, H, K).transpose(1, 2) # BHTK
-        k = self.key(kx).view(B, T, KVH, K).transpose(1, 2)      # BHTK
-        v = self.value(vx).view(B, T, KVH, V).transpose(1, 2)    # BHTV
-        g = F.silu(self.gate(gx))
+        r = self.receptance(xr)
+        k = self.key(xk)
+        v = self.value(xv)
+        g = F.silu(self.gate(xg))
 
-        #r, k = self.rotary_positional_embedding((r, k))
+        ww = torch.tanh(xw @ self.time_decay_w1) @ self.time_decay_w2
+        w = self.time_decay + ww
+        
+        if self.inference:
+            self.state = x
 
-        # support for grouped-query attention
-        # if there are fewer k/v heads than total heads, repeat them until the number matches
-        time_decay = self.time_decay.float() # (KVH,K)
-        time_first = self.time_first.float() # (KVH,K)
-        if KVH < H:
-            reps = H // KVH
-            k = k[:,:,None,:,:].expand(B, KVH, reps, T, K).contiguous().view(B, H, T, K)
-            v = v[:,:,None,:,:].expand(B, KVH, reps, T, V).contiguous().view(B, H, T, V)
-            time_decay = time_decay.expand(reps, KVH, K).contiguous().view(H, K)
-            time_first = time_first.expand(reps, KVH, K).contiguous().view(H, K)
+        return r, k, v, g, w
 
-        kv_state = recurrent_memory
-        if kv_state is None:
-            kv_state = torch.zeros(B, H, K, V, device=r.device, dtype=r.dtype)
+    @MyFunction
+    def jit_func_2(self, x, g):
+        B, T, C = x.size()
+        x = x.view(B * T, C)
 
-        if r.dtype == torch.bfloat16 and kv_state.dtype != torch.bfloat16:
-            kv_state = kv_state.contiguous().to(torch.bfloat16)        
-
-        w = time_decay.unsqueeze(0).unsqueeze(2) # 1H1K
-        w = w + (torch.tanh(wx @ self.td_w1) @ self.td_w2).view(B, H, T, K) # BHTK
-        w = torch.exp(-torch.exp(w))
-
-        u = time_first.unsqueeze(0).unsqueeze(2) # 1H1K
-
-        out, s = rwkv_inner(r, k, v, w, u, kv_state)
-
-        out = out.transpose(1,2).reshape(B*T, H*V)
-        out = self.ln_x(out / self.args.head_size_divisor).view(B, T, H*V)
-
-        out = self.output(out * g)
-        return out
-
-class RMSNorm(nn.Module):
-    def __init__(self, dim : int, weight_scaling : bool = True, eps = 1e-8):
-        super().__init__()
-        self.eps = eps
-        self.dim = dim
-        starting_scale = dim ** -0.5
-        if weight_scaling:
-            self.register_parameter("scale", nn.Parameter(torch.ones(dim) * starting_scale))
-        else:
-            self.scale = starting_scale
+        x = self.ln_x(x).view(B, T, C)
+        x = self.output(x * g)
+        return x
 
     def forward(self, x):
-        assert(self.dim == x.size(-1))
-        rms_norm = self.scale * x.norm(2, dim=-1, keepdim=True)
-        return x / rms_norm.clamp(self.eps)
-    
-    @staticmethod
-    def F(x, eps = 1e-8):
-        rms_norm = (x.size(-1) ** -0.5) * x.norm(2, dim=-1, keepdim=True)
-        return x / rms_norm.clamp(eps)
+        B, T, C = x.size()
+        H = self.n_head
+
+        r, k, v, g, w = self.jit_func(x)
+        if self.inference:
+            x = self.wkv(r, k, v, w)
+        else:
+            x = RUN_CUDA_RWKV6(B, T, C, H, r, k, v, w.bfloat16(), u=self.time_faaaa.bfloat16())
+
+        return self.jit_func_2(x, g)
 
 
-
-class RWKV_ChannelMixSubLayer(nn.Module):
-    def __init__(self, hparams, layer_id):
+class RWKV_CMix_x060(nn.Module):
+    def __init__(self, d_model, layer_id, n_layer):
         super().__init__()
-        args = RWKVConfig(hparams)
-        self.args = args
         self.layer_id = layer_id
+        self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
+        dim_ffn = int((d_model * 3.5) // 32 * 32)
 
         with torch.no_grad():  # fancy init of time_mix
-            self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
-            ratio_1_to_almost0 = 1.0 - (layer_id / args.n_layer)  # 1 to ~0
-            ddd = torch.ones(1, 1, args.n_embd)
-            for i in range(args.n_embd):
-                ddd[0, 0, i] = i / args.n_embd
-            self.time_mix_k = nn.Parameter(torch.pow(ddd, ratio_1_to_almost0))
-            self.time_mix_r = nn.Parameter(torch.pow(ddd, ratio_1_to_almost0))
+            ratio_1_to_almost0 = 1.0 - (layer_id / n_layer)  # 1 to ~0
+            ddd = torch.ones(1, 1, d_model)
+            for i in range(d_model):
+                ddd[0, 0, i] = i / d_model
+            self.time_maa_k = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0))
+            self.time_maa_r = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0))
 
-        self.key = nn.Linear(args.n_embd, args.dim_ffn, bias=False)
-        self.receptance = nn.Linear(args.n_embd, args.n_embd, bias=False)
-        self.value = nn.Linear(args.dim_ffn, args.n_embd, bias=False)
+        self.key = nn.Linear(d_model, dim_ffn, bias=False)
+        self.receptance = nn.Linear(d_model, d_model, bias=False)
+        self.value = nn.Linear(dim_ffn, d_model, bias=False)
+        self.inference = False
+        self.state = None
 
-    def post_init_fn(self, myself):
-        zero = [self.value, self.receptance]
-        for m in zero:
-            nn.init.zeros_(m.weight)
-        ortho = [self.key]
-        for m in ortho:
-            if m.weight.shape[0] > m.weight.shape[1]:
-                gain = math.sqrt(m.weight.shape[0] / m.weight.shape[1])
-            else:
-                gain = 1.0
-            nn.init.orthogonal_(m.weight, gain=gain)
+    @MyFunction
+    def forward(self, x):
+        if self.inference:
+            state = self.state
+            if state is None:
+                state = torch.zeros_like(x)
+        else:
+            state = self.time_shift(x)
 
-    def forward(self, x, xx=None):
-        if xx is None:
-            xx = self.time_shift(x)
-        xk = x * self.time_mix_k + xx * (1 - self.time_mix_k)
-        xr = x * self.time_mix_r + xx * (1 - self.time_mix_r)
+        xx =  state - x
+        xk = x + xx * self.time_maa_k
+        xr = x + xx * self.time_maa_r
+
         k = self.key(xk)
-        k = torch.square(torch.relu(k))
+        k = torch.relu(k) ** 2
         kv = self.value(k)
+        if self.inference:
+            self.state = x
         return torch.sigmoid(self.receptance(xr)) * kv
-@dataclass
-class HParams:
-    d_model: int
-    n_head: int
-    n_layer: int
-    n_kv_head_ratio: int = 1
-    feedforward_d_model_ratio: int = 3
-    d_qk_ratio: int = 1
-    d_v_ratio: int = 1
-    max_sequence_length: int = 2000
+
+
 
 def exists(x):
     return x is not None
@@ -314,53 +332,55 @@ class AttentiveRWKV6(AttentiveRNN):
         d_context,
         heads,
         dropout_att=0.0,
-        d_blind=64,
+        d_blind=128,
         blind=False,
+        light=False,
     ):
         super().__init__()
-        self.hparams = HParams(d_model=d_model, n_head=heads, n_layer=n_layer)
-        self.b_hparams = HParams(d_model=d_blind, n_head=heads, n_layer=1)
-        block = lambda hparams, layer_id: GPTBlock(lambda: RWKV6_0_AttentionSubLayer(hparams, layer_id),
-                                                   lambda: RWKV_ChannelMixSubLayer(hparams, layer_id),
-                                                   lambda: RMSNorm(hparams.d_model),)
-        self.encoder = nn.Sequential(*[block(self.hparams, i) for i in range(n_layer)])
-        self.decoder = nn.Sequential(*[block(self.hparams, i) for i in range(n_layer)])
+        block = lambda dim, heads, lay_i, n_lay: MixingBlock(lambda: RWKV_TMix_x060(dim, heads, lay_i, n_lay),
+                                                   lambda: SwiGLU(dim) if light else RWKV_CMix_x060(dim, lay_i, n_lay),
+                                                   lambda: nn.LayerNorm(dim),)
+        self.encoder = nn.Sequential(*[block(d_model, heads, i, n_layer) for i in range(n_layer)])
+        self.decoder = nn.Sequential(*[block(d_model, heads, i, n_layer) for i in range(n_layer)])
         self.cross_att = (
             BlindCrossAttention(
-                d_model, d_context, d_model, heads, block(self.b_hparams, 0), dropout_att
+                d_model, d_context, d_model, heads, block(d_blind, 1, 0, 2), dropout_att, pos_dim=d_blind,
             )
             if blind
             else CrossAttention(d_model, d_context, d_model, heads, dropout_att)
         )
 
-    def forward(self, x, ctx, x_mask=None, ctx_mask=None, chunk_size=32):
-        b, i, d = x.shape
-        i_pad = chunk_size - i % chunk_size
-        x_pad = torch.cat((x, torch.zeros(b, i_pad, d, device=x.device)), dim=1)
+    def forward(self, x, ctx, x_mask=None, ctx_mask=None):
         if exists(x_mask) and exists(ctx_mask):
-            x_mask_pad = torch.cat(
-                (
-                    x_mask,
-                    torch.zeros(b, i_pad, device=x.device, dtype=torch.bool),
-                ),
-                dim=1,
-            )
-
-            mask = rearrange(x_mask_pad, "b i -> b i 1") * rearrange(
+            mask = rearrange(x_mask, "b i -> b i 1") * rearrange(
                 ctx_mask, "b j -> b 1 j"
             )
             mask = rearrange(mask, "b i j -> b 1 i j")
         else:
             mask = None
-        y = self.encoder(x_pad)
+        y = torch.utils.checkpoint.checkpoint_sequential(self.encoder, len(self.encoder), x, use_reentrant=False)
         v, att = self.cross_att(y, ctx, mask=mask)
-        y = self.decoder(y + v)
-        return y[:, :i], att
+        y = torch.utils.checkpoint.checkpoint_sequential(self.decoder, len(self.decoder), y + v, use_reentrant=False)
+ 
+        return y, att
 
     def init_state(self, max_seqlen=1000):
-        pass
+        for be, bd in zip(self.encoder, self.decoder):
+            be.tmix.inference, bd.tmix.inference = True, True
+            be.cmix.inference, bd.cmix.inference = True, True
+            be.tmix.state, bd.tmix.state = None, None
+            be.cmix.state, bd.cmix.state = None, None
+            be.tmix.kv_state, bd.tmix.kv_state = None, None
+        self.cross_att.pos_net.tmix.inference = True
+        self.cross_att.pos_net.cmix.inference = True
+        self.cross_att.pos_net.tmix.state = None
+        self.cross_att.pos_net.cmix.state = None
+        self.cross_att.pos_net.tmix.kv_state = None
+
 
     def step(self, y_embd, x_enc, time_step):
-        pass
-
-
+        y_embd = self.encoder(y_embd)
+        v, att = self.cross_att(y_embd, x_enc, time_step=time_step)
+        y_embd = y_embd + v
+        y_embd = self.decoder(y_embd)
+        return y_embd, att

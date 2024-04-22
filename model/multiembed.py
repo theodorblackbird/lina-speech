@@ -6,7 +6,7 @@ from torch import nn
 
 class MultiEmbedding(nn.Module):
     """
-    Stacks homogeneous embeddings (same size, same embedding dim.) into one single weight tensor.
+    Stacks multiple homogeneous embedding (same size, same embedding dim.) into one single weight.
     """
 
     def __init__(self, n_level, n_emb, d_emb, padding_idx=None):
