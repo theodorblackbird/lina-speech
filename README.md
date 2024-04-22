@@ -1,32 +1,58 @@
-# lina-speech (alpha)
+# lina-speech (beta)
 
 Exploring "linear attention" for text-to-speech.
 
 It predicts audio codec "à la" [MusicGen](https://arxiv.org/abs/2306.05284) : delayed residual vector quantizers so that we do not need multiple models.
+
 Featuring [RWKV](https://github.com/BlinkDL/RWKV-LM), [Mamba](https://github.com/state-spaces/mamba), [Gated Linear Attention](https://github.com/sustcsonglin/flash-linear-attention).
 
-Consider this as highly experimental and subject to many changes in the near future.
+Compared to other LM TTS model :
+- Can be easily pretrained and finetuned on midrange GPUs.
+- Tiny memory footprint.
+- Trained on long context (up to 2000 tokens : ~27s).
 
-### Samples
+### Models
 
-Mamba based (60M parameters) :
+| Model | #Params | Dataset | Checkpoint | Steps | Note |
+| :---: | :---: |:---: |:---: |:---: |:---: |
+| GLA | 60M | Librilight-medium | [Download](https://nubo.ircam.fr/index.php/s/wjNYLb54m7L8xf9) | 300k | GPU inference only |
+| Mamba| 60M | Librilight-medium |[Download](https://nubo.ircam.fr/index.php/s/wjNYLb54m7L8xf9)| 300k | GPU inference only |
+| RWKV v6 | 60M | LibriTTS |[Download](https://nubo.ircam.fr/index.php/s/wjNYLb54m7L8xf9) | 150k | Inference : _WKV_ operator inconsistent with CUDA implem. |
 
-https://theodorblackbird.github.io/blog/demo_alpha/
+### Installation
+Following the linear complexity LM you choose, follow respective instructions first:
+- For Mamba check the [official repo](https://github.com/state-spaces/mamba).
+- For GLA check [flash-linear-attention](https://github.com/sustcsonglin/flash-linear-attention).
+- For RWKV check [RWKV-LM](https://github.com/BlinkDL/RWKV-LM)
 
-### Prepare a dataset
+### Inference
 
-Soon
+Download configuration and weights above, then check `Inference.ipynb`.
 
-### Training
+### TODO
 
-`python train.py fit -c config/libritts-train-360.yaml`
+- [ ] Fix RWKV6 inference and/or switch to FLA implem.
+- [ ] Provide a Datamodule for training (_lhotse_ might also work well).
+- [ ] Implement CFG.
+- [ ] Scale up.
 
 ### Acknowledgment
 
 - The RWKV authors and the community around for carrying high-level truly opensource research.
 - @SmerkyG for making my life easy at testing cutting edge language model.
-- @lucidrains for its huge and easy to understand codebase.
+- @lucidrains for its huge codebase.
+- @sustcsonglin who made [GLA and FLA](https://github.com/sustcsonglin/flash-linear-attention).
 
+### Cite
+```bib
+@software{lemerle2024linaspeech,
+  title  = {LinaSpeech: Exploring "linear attention" for text-to-speech.},
+  author = {Lemerle, Théodor},
+  url    = {https://github.com/theodorblackbird/lina-speech},
+  month  = april,
+  year   = {2024}
+}
+```
 ### IRCAM
 
 This work takes place at IRCAM, and is part of the following project :
