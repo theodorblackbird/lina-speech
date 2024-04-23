@@ -197,26 +197,49 @@ class RWKV_TMix_x060(nn.Module):
         )
 
     def wkv(self, r, k, v, w):
-            w = torch.exp(-torch.exp(w))
-            r, v, w = map(lambda x: rearrange(x, "b n (h c) -> b h n c", h=self.n_head), (r, v, w))
-            k = rearrange(k, "b n (h c) -> b h c n", h=self.n_head)
-            y = torch.zeros_like(v)
-            b, _, n, _ = r.shape
+            w = torch.exp(-torch.exp(w.double()))
+
+            B,T,C = r.size()
             if self.kv_state is None:
-                    self.kv_state = torch.zeros(b, self.n_head, self.head_size, self.head_size, device=r.device).bfloat16()
+                    self.kv_state = torch.zeros(B, self.n_head, self.head_size, self.head_size, device=r.device).double()
+            
+            #int64_t B, int64_t T, int64_t K, int64_t H, torch::Tensor &state, torch::Tensor &r, torch::Tensor &k, torch::Tensor &v, torch::Tensor &w, torch::Tensor &y
+            
+            # xr = (( v ).view(B,T,self.n_head,self.head_size)*(k*r*self.time_faaaa.view(1,1,C)).view(B,T,self.n_head,self.head_size).sum(-1,True)).view(B,T,C)
 
-            for t in range(n):
-                    rt = r[:, :, [t], :]
-                    kt = k[:, :, :, [t]]
-                    vt = v[:, :, [t], :]
-                    wt = w[:, :, [t]]
-                    kvt =  kt @ vt
-                    ot = rt @ (self.time_faaaa[None, ..., None] * kvt + self.kv_state)
-                    y[:, :, t] = ot.squeeze(2)
-                    self.kv_state = self.kv_state * wt + kvt
+            # torch.ops.wkv6f.forward(B,T,self.head_size,self.n_head,self.kv_state,r,k,v,w,xr)
+            # return xr
+            B,T,C = r.size()
+            K = self.head_size
+            H = self.n_head
+            
+            k = k.view(B,T,H,K).transpose(0,1).reshape(T,B,H,1,K).double()
+            r = r.view(B,T,H,K).transpose(0,1).reshape(T,B,H,1,K).double()
+            v = v.view(B,T,H,K).transpose(0,1).reshape(T,B,H,1,K).double()
+            w = w.view(B,T,H,K).transpose(0,1).reshape(T,B,H,1,K).to(r.dtype)
+            
+         
+            
+            # xr = (( v )*(k*r.view(T,B,H,1,K)*self.time_faaaa.view(1,1,H,1,K)).sum(-1,True)).reshape(-1,T,K)
 
-            y = rearrange(y, "b h n c -> b n (h c)")
-            return y
+            kk = k.reshape(T,-1,K).transpose(0,1).transpose(1,2)
+            vv = v.reshape(T,-1,K).transpose(0,1)
+            
+            r = r.reshape(H*B,T,-1)
+            xr = torch.zeros(B*H,T,K,device=r.device).double()
+            for i in range(T):
+                
+                xr[:,i:i+1] = torch.bmm(r[:,i:i+1],self.kv_state[:B].view(-1,K,K).add(v.view(-1,1,K).mul(k.view(-1,K,1)).mul(self.time_faaaa.view(-1,K,1))))
+                
+                # calculate the effects time has on the state
+                torch.mul(self.kv_state[:B].view(-1,H,K,K),w[i].view(B,H,K,1),out=self.kv_state[:B].view(-1,H,K,K))
+                
+                #calculate the effects k,v have on the state
+                torch.baddbmm(self.kv_state[:B].view(-1,K,K),kk[:,:,i:i+1],vv[:,i:i+1],out=self.kv_state[:B].view(-1,K,K))
+            
+            
+            return xr.view(T,B,H,K).transpose(0,1).reshape(B,T,H*K).float()
+
 
 
     @MyFunction
