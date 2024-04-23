@@ -17,7 +17,7 @@ Compared to other LM TTS model :
 | :---: | :---: |:---: |:---: |:---: |:---: |
 | GLA | 60M | Librilight-medium | [Download](https://nubo.ircam.fr/index.php/s/wjNYLb54m7L8xf9) | 300k | GPU inference only |
 | Mamba| 60M | Librilight-medium |[Download](https://nubo.ircam.fr/index.php/s/wjNYLb54m7L8xf9)| 300k | GPU inference only |
-| RWKV v6 | 60M | LibriTTS |[Download](https://nubo.ircam.fr/index.php/s/wjNYLb54m7L8xf9) | 150k | Inference : _WKV_ operator inconsistent with CUDA implem. |
+| RWKV v6 | 60M | LibriTTS |[Download](https://nubo.ircam.fr/index.php/s/wjNYLb54m7L8xf9) | 150k | GPU inference only |
 
 ### Installation
 Following the linear complexity LM you choose, follow respective instructions first:
@@ -31,7 +31,7 @@ Download configuration and weights above, then check `Inference.ipynb`.
 
 ### TODO
 
-- [ ] Fix RWKV6 inference and/or switch to FLA implem.
+- [x] Fix RWKV6 inference and/or switch to FLA implem.
 - [ ] Provide a Datamodule for training (_lhotse_ might also work well).
 - [ ] Implement CFG.
 - [ ] Scale up.
@@ -42,6 +42,7 @@ Download configuration and weights above, then check `Inference.ipynb`.
 - @SmerkyG for making my life easy at testing cutting edge language model.
 - @lucidrains for its huge codebase.
 - @sustcsonglin who made [GLA and FLA](https://github.com/sustcsonglin/flash-linear-attention).
+- @harrisonvanderbyl fixing RWKV inference.
 
 ### Cite
 ```bib
