@@ -15,7 +15,7 @@ from fla.ops.gla import fused_chunk_gla
 
 from torch.utils.cpp_extension import load
 
-
+from fla.ops.rwkv6.chunk import chunk_rwkv6
 #adapted from https://github.com/BlinkDL/RWKV-LM/blob/main/RWKV-v5/src/model.py
 
 def __noop(ob):
@@ -195,28 +195,13 @@ class RWKV_TMix_x060(nn.Module):
         self.ln_x = nn.GroupNorm(
             self.n_head, d_model, eps=(1e-5) * (self.head_size_divisor**2)
         )
+        self.kv_state = None
 
     def wkv(self, r, k, v, w):
-            w = torch.exp(-torch.exp(w))
-            r, v, w = map(lambda x: rearrange(x, "b n (h c) -> b h n c", h=self.n_head), (r, v, w))
-            k = rearrange(k, "b n (h c) -> b h c n", h=self.n_head)
-            y = torch.zeros_like(v)
-            b, _, n, _ = r.shape
-            if self.kv_state is None:
-                    self.kv_state = torch.zeros(b, self.n_head, self.head_size, self.head_size, device=r.device).bfloat16()
-
-            for t in range(n):
-                    rt = r[:, :, [t], :]
-                    kt = k[:, :, :, [t]]
-                    vt = v[:, :, [t], :]
-                    wt = w[:, :, [t]]
-                    kvt =  kt @ vt
-                    ot = rt @ (self.time_faaaa[None, ..., None] * kvt + self.kv_state)
-                    y[:, :, t] = ot.squeeze(2)
-                    self.kv_state = self.kv_state * wt + kvt
-
-            y = rearrange(y, "b h n c -> b n (h c)")
-            return y
+            # if self.inference:
+        x,self.kv_state = chunk_rwkv6(r.view(B,T,H,K).transpose(1,2),k.view(B,T,H,K).transpose(1,2),v.view(B,T,H,K).transpose(1,2),w.view(B,T,H,K).transpose(2,1).exp().neg(),self.time_faaaa.view(H,K),1.0,self.kv_state,True,0)
+        # else:
+        return x.view(B , T, C)
 
 
     @MyFunction
