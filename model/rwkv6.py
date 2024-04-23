@@ -229,7 +229,7 @@ class RWKV_TMix_x060(nn.Module):
             xr = torch.zeros(B*H,T,K,device=r.device).double()
             for i in range(T):
                 
-                xr[:,i:i+1] = torch.bmm(r[:,i:i+1],self.kv_state[:B].view(-1,K,K).add(v.view(-1,1,K).mul(k.view(-1,K,1)).mul(self.time_faaaa.view(-1,K,1))))
+                xr[:,i] = torch.bmm(r[:,i:i+1],self.kv_state[:B].view(B,-1,K,K).add((v[i].view(B,-1,1,K).mul(k[i].view(B,-1,K,1)).mul(self.time_faaaa.view(1,-1,K,1)))).view(-1,K,K)).view(B*H,K)
                 
                 # calculate the effects time has on the state
                 torch.mul(self.kv_state[:B].view(-1,H,K,K),w[i].view(B,H,K,1),out=self.kv_state[:B].view(-1,H,K,K))
@@ -239,7 +239,6 @@ class RWKV_TMix_x060(nn.Module):
             
             
             return xr.view(T,B,H,K).transpose(0,1).reshape(B,T,H*K).float()
-
 
 
     @MyFunction
