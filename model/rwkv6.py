@@ -15,7 +15,7 @@ from fla.ops.gla import fused_chunk_gla
 
 from torch.utils.cpp_extension import load
 
-
+from fla.ops.rwkv6.chunk import chunk_rwkv6
 #adapted from https://github.com/BlinkDL/RWKV-LM/blob/main/RWKV-v5/src/model.py
 
 def __noop(ob):
@@ -195,50 +195,13 @@ class RWKV_TMix_x060(nn.Module):
         self.ln_x = nn.GroupNorm(
             self.n_head, d_model, eps=(1e-5) * (self.head_size_divisor**2)
         )
+        self.kv_state = None
 
     def wkv(self, r, k, v, w):
-            w = torch.exp(-torch.exp(w.double()))
-
-            B,T,C = r.size()
-            if self.kv_state is None:
-                    self.kv_state = torch.zeros(B, self.n_head, self.head_size, self.head_size, device=r.device).double()
-            
-            #int64_t B, int64_t T, int64_t K, int64_t H, torch::Tensor &state, torch::Tensor &r, torch::Tensor &k, torch::Tensor &v, torch::Tensor &w, torch::Tensor &y
-            
-            # xr = (( v ).view(B,T,self.n_head,self.head_size)*(k*r*self.time_faaaa.view(1,1,C)).view(B,T,self.n_head,self.head_size).sum(-1,True)).view(B,T,C)
-
-            # torch.ops.wkv6f.forward(B,T,self.head_size,self.n_head,self.kv_state,r,k,v,w,xr)
-            # return xr
-            B,T,C = r.size()
-            K = self.head_size
-            H = self.n_head
-            
-            k = k.view(B,T,H,K).transpose(0,1).reshape(T,B,H,1,K).double()
-            r = r.view(B,T,H,K).transpose(0,1).reshape(T,B,H,1,K).double()
-            v = v.view(B,T,H,K).transpose(0,1).reshape(T,B,H,1,K).double()
-            w = w.view(B,T,H,K).transpose(0,1).reshape(T,B,H,1,K).to(r.dtype)
-            
-         
-            
-            # xr = (( v )*(k*r.view(T,B,H,1,K)*self.time_faaaa.view(1,1,H,1,K)).sum(-1,True)).reshape(-1,T,K)
-
-            kk = k.reshape(T,-1,K).transpose(0,1).transpose(1,2)
-            vv = v.reshape(T,-1,K).transpose(0,1)
-            
-            r = r.reshape(H*B,T,-1)
-            xr = torch.zeros(B*H,T,K,device=r.device).double()
-            for i in range(T):
-                
-                xr[:,i] = torch.bmm(r[:,i:i+1],self.kv_state[:B].view(B,-1,K,K).add((v[i].view(B,-1,1,K).mul(k[i].view(B,-1,K,1)).mul(self.time_faaaa.view(1,-1,K,1)))).view(-1,K,K)).view(B*H,K)
-                
-                # calculate the effects time has on the state
-                torch.mul(self.kv_state[:B].view(-1,H,K,K),w[i].view(B,H,K,1),out=self.kv_state[:B].view(-1,H,K,K))
-                
-                #calculate the effects k,v have on the state
-                torch.baddbmm(self.kv_state[:B].view(-1,K,K),kk[:,:,i:i+1],vv[:,i:i+1],out=self.kv_state[:B].view(-1,K,K))
-            
-            
-            return xr.view(T,B,H,K).transpose(0,1).reshape(B,T,H*K).float()
+            # if self.inference:
+        x,self.kv_state = chunk_rwkv6(r.view(B,T,H,K).transpose(1,2),k.view(B,T,H,K).transpose(1,2),v.view(B,T,H,K).transpose(1,2),w.view(B,T,H,K).transpose(2,1).exp().neg(),self.time_faaaa.view(H,K),1.0,self.kv_state,True,0)
+        # else:
+        return x.view(B , T, C)
 
 
     @MyFunction
