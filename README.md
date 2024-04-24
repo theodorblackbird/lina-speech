@@ -22,8 +22,8 @@ Compared to other LM TTS model :
 ### Installation
 Following the linear complexity LM you choose, follow respective instructions first:
 - For Mamba check the [official repo](https://github.com/state-spaces/mamba).
-- For GLA check [flash-linear-attention](https://github.com/sustcsonglin/flash-linear-attention).
-- For RWKV check [RWKV-LM](https://github.com/BlinkDL/RWKV-LM)
+- For GLA/RWKV inference check [flash-linear-attention](https://github.com/sustcsonglin/flash-linear-attention).
+- For RWKV training check [RWKV-LM](https://github.com/BlinkDL/RWKV-LM)
 
 ### Inference
 
