@@ -15,7 +15,7 @@ Compared to other LM TTS model :
 
 | Model | #Params | Dataset | Checkpoint | Steps | Note |
 | :---: | :---: |:---: |:---: |:---: |:---: |
-| GLA | 60M | Librilight-medium | [Download](https://nubo.ircam.fr/index.php/s/wjNYLb54m7L8xf9) | 300k | GPU inference only |
+| GLA | 60M, 130M | Librilight-medium | [Download](https://nubo.ircam.fr/index.php/s/wjNYLb54m7L8xf9) | 300k | GPU inference only |
 | Mamba| 60M | Librilight-medium |[Download](https://nubo.ircam.fr/index.php/s/wjNYLb54m7L8xf9)| 300k | GPU inference only |
 | RWKV v6 | 60M | LibriTTS |[Download](https://nubo.ircam.fr/index.php/s/wjNYLb54m7L8xf9) | 150k | GPU inference only |
 
