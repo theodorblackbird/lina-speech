@@ -272,8 +272,8 @@ class Lina(ptl.LightningModule):
 
         atts =  torch.cat(atts, dim=2) if exists(atts[0]) else None
         return qs, atts
-    def on_train_epoch_start(self):
-        self.trainer.train_dataloader.batch_sampler.set_epoch(self.current_epoch)
+    #def on_train_epoch_start(self):
+    #    self.trainer.train_dataloader.batch_sampler.set_epoch(self.current_epoch)
 
 
     def training_step(self, batch, _):
