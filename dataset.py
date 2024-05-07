@@ -2,6 +2,7 @@ from datasets import load_dataset
 from collections import defaultdict
 from torch.utils.data import DataLoader
 from torch.nn.utils.rnn import pad_sequence
+from csv import reader
 import pytorch_lightning as ptl
 import torch
 import math
@@ -108,6 +109,7 @@ class LinaDataModule(ptl.LightningDataModule):
             self,
             path,
             quant_layer,
+            codec_rate_hz=50,
             batch_size=None,
             token_by_batch=None,
             num_workers=8,
@@ -118,6 +120,7 @@ class LinaDataModule(ptl.LightningDataModule):
             ):
         super().__init__()
         self.path = path
+        self.codec_rate_hz = codec_rate_hz
         self.batch_size = batch_size
         self.token_by_batch = token_by_batch
         self.num_workers = num_workers
@@ -129,6 +132,7 @@ class LinaDataModule(ptl.LightningDataModule):
 
     def setup(self, stage):
         self.dataset = load_dataset(self.path).with_format("torch").map(lambda x: {"len": x["audio_token"].shape[-1]})
+
         lens = self.dataset["train"]["len"].tolist()
         maxl, minl = max(lens), min(lens)
         if self.n_buckets > 1:
@@ -143,7 +147,13 @@ class LinaDataModule(ptl.LightningDataModule):
             for i, l in enumerate(lens):
                 buckets[get_bucket_num(l)].append(i)
             buckets = [x for x in buckets.values()]
-            batch_sizes = [int(self.token_by_batch/x) for x in bound] if self.token_by_batch is not None else self.batch_size
+            self.batch_bound = defaultdict(lambda: [])
+            for lb, hb in zip(bound[:-1], bound[1:]):
+                self.batch_bound[self.token_by_batch//hb] = (lb, hb)
+            batch_sizes = list(self.batch_bound.keys()) if self.token_by_batch is not None else self.batch_size
+
+            print(batch_sizes)
+            self.bound = bound
             self.batch_sampler = BucketSampler(buckets, batch_sizes=batch_sizes, seed=self.seed, sample_bucket=self.bucket_size)
         else:
             self.batch_sampler = None
@@ -151,8 +161,16 @@ class LinaDataModule(ptl.LightningDataModule):
 
 
     def collate_fn(self, batch):
+        audio_token = [x["audio_token"] for x in batch]
+        text_token = [x["text_token"] for x in batch]
+        align = [x["align"] for x in batch]
+
         if self.random_crop:
-            time = self.token_by_batch//len(batch)
+            lb, hb = self.batch_bound[len(batch)]
+            cut = random.randint(lb, hb)/self.codec_rate_hz
+            txt, dur = zip(*[random_crop(al, cut) for al in align])
+            code = [yy[:, :int(d * self.codec_rate_hz)] for yy, d in zip(code, dur)]
+
         audio_token = [
                 delay_rvq(
                     x["audio_token"].squeeze()[self.quant_layer] + 3,
