@@ -7,6 +7,7 @@ import pytorch_lightning as ptl
 import torch
 import math
 import random
+import bisect
 from random import choices
 import numpy as np
 from typing import List, Optional, Tuple, Union, Dict
@@ -103,6 +104,17 @@ class BucketSampler(Sampler[List[int]]):
                 if weights is not None:
                     weights.pop(idx)
 
+def random_crop(al, dur):
+    txt = [x[-1] for x in al]
+    align = [(i, float(x[0])) for i, x in enumerate(al) ]
+    idx, start = zip(*align)
+    pos = min(len(start)-1, bisect.bisect_left(start, dur)+1)
+    stop_idx = idx[pos]
+    dur = start[pos]
+    txt = ",".join(txt[:stop_idx])
+    txt = [1] + [int(x) for x in txt.split(",")] + [2]
+
+    return txt, dur
 
 class LinaDataModule(ptl.LightningDataModule):
     def __init__(
@@ -130,16 +142,18 @@ class LinaDataModule(ptl.LightningDataModule):
         self.bucket_size = bucket_size
         self.seed = seed
 
+
     def setup(self, stage):
-        self.dataset = load_dataset(self.path).with_format("torch").map(lambda x: {"len": x["audio_token"].shape[-1]})
+        self.dataset = load_dataset(self.path).with_format("torch").map(lambda x: {"len": x["audio_token"].shape[-1]}).filter(lambda x: x["align_token"] is not None and len(x["align_token"]) > 1)
 
         lens = self.dataset["train"]["len"].tolist()
         maxl, minl = max(lens), min(lens)
         if self.n_buckets > 1:
             bound = np.linspace(minl, maxl+1, num=self.n_buckets+1, dtype=int)
+            bound = [ int(x) for x in bound ]
             def get_bucket_num(sz):
                 lb = bound[:-1]
-                hb = [maxl]*(self.n_buckets+1) if self.random_crop else  bound[1:]
+                hb = bound[1:]#[maxl]*(self.n_buckets) if self.random_crop else  bound[1:]
                 for i, (low, high) in enumerate(zip(lb, hb)):
                     if sz >= low and sz < high:
                         return i
@@ -151,8 +165,6 @@ class LinaDataModule(ptl.LightningDataModule):
             for lb, hb in zip(bound[:-1], bound[1:]):
                 self.batch_bound[self.token_by_batch//hb] = (lb, hb)
             batch_sizes = list(self.batch_bound.keys()) if self.token_by_batch is not None else self.batch_size
-
-            print(batch_sizes)
             self.bound = bound
             self.batch_sampler = BucketSampler(buckets, batch_sizes=batch_sizes, seed=self.seed, sample_bucket=self.bucket_size)
         else:
@@ -163,13 +175,13 @@ class LinaDataModule(ptl.LightningDataModule):
     def collate_fn(self, batch):
         audio_token = [x["audio_token"] for x in batch]
         text_token = [x["text_token"] for x in batch]
-        align = [x["align"] for x in batch]
+        align_token = [x["align_token"] for x in batch]
 
         if self.random_crop:
             lb, hb = self.batch_bound[len(batch)]
             cut = random.randint(lb, hb)/self.codec_rate_hz
-            txt, dur = zip(*[random_crop(al, cut) for al in align])
-            code = [yy[:, :int(d * self.codec_rate_hz)] for yy, d in zip(code, dur)]
+            text_token, dur = zip(*[random_crop(al, cut) for al in align_token])
+            audio_token = [yy[:, :int(d * self.codec_rate_hz)] for yy, d in zip(audio_token, dur)]
 
         audio_token = [
                 delay_rvq(
