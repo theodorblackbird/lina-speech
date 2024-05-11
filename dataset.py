@@ -113,6 +113,7 @@ def random_crop(al, dur):
     dur = start[pos]
     txt = ",".join(txt[:stop_idx])
     txt = [1] + [int(x) for x in txt.split(",")] + [2]
+    txt = torch.LongTensor(txt)
 
     return txt, dur
 
@@ -129,6 +130,8 @@ class LinaDataModule(ptl.LightningDataModule):
             seed=123,
             random_crop=False,
             bucket_size=None,
+            min_len=None,
+            max_len=None,
             ):
         super().__init__()
         self.path = path
@@ -140,6 +143,8 @@ class LinaDataModule(ptl.LightningDataModule):
         self.n_buckets = n_buckets
         self.random_crop = random_crop
         self.bucket_size = bucket_size
+        self.min_len = min_len
+        self.max_len = max_len
         self.seed = seed
 
 
@@ -148,18 +153,22 @@ class LinaDataModule(ptl.LightningDataModule):
 
         lens = self.dataset["train"]["len"].tolist()
         maxl, minl = max(lens), min(lens)
+        if self.min_len is not None:
+            minl = self.min_len
+        if self.max_len is not None:
+            maxl = self.max_len
         if self.n_buckets > 1:
             bound = np.linspace(minl, maxl+1, num=self.n_buckets+1, dtype=int)
             bound = [ int(x) for x in bound ]
             def get_bucket_num(sz):
                 lb = bound[:-1]
-                hb = bound[1:]#[maxl]*(self.n_buckets) if self.random_crop else  bound[1:]
-                for i, (low, high) in enumerate(zip(lb, hb)):
-                    if sz >= low and sz < high:
-                        return i
+                hb = [maxl]*self.n_buckets if self.random_crop else  bound[1:]
+                print(lb, hb)
+                return [i for i, (low, high) in enumerate(zip(lb, hb)) if sz >= low and sz < high]
             buckets = defaultdict(lambda: [])
             for i, l in enumerate(lens):
-                buckets[get_bucket_num(l)].append(i)
+                for bn in get_bucket_num(l):
+                    buckets[bn].append(i)
             buckets = [x for x in buckets.values()]
             self.batch_bound = defaultdict(lambda: [])
             for lb, hb in zip(bound[:-1], bound[1:]):
@@ -181,18 +190,17 @@ class LinaDataModule(ptl.LightningDataModule):
             lb, hb = self.batch_bound[len(batch)]
             cut = random.randint(lb, hb)/self.codec_rate_hz
             text_token, dur = zip(*[random_crop(al, cut) for al in align_token])
-            audio_token = [yy[:, :int(d * self.codec_rate_hz)] for yy, d in zip(audio_token, dur)]
+            audio_token = [yy[..., :int(d * self.codec_rate_hz)] for yy, d in zip(audio_token, dur)]
 
         audio_token = [
                 delay_rvq(
-                    x["audio_token"].squeeze()[self.quant_layer] + 3,
+                    x.squeeze()[self.quant_layer] + 3,
                     head_token=1,
                     tail_token=2,
                     ).T
-                for x in batch
+                for x in audio_token
                 ]
 
-        text_token = [x["text_token"] for x in batch]
         audio_lens, text_lens = map(lambda x: torch.LongTensor([len(t) for t in x]), (audio_token, text_token))
         audio_token, text_token = map(lambda x: pad_sequence(x, batch_first=True, padding_value=0), (audio_token, text_token))
         return text_token, audio_token, text_lens, audio_lens, None, None, None
