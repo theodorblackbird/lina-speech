@@ -106,7 +106,7 @@ class BucketSampler(Sampler[List[int]]):
 
 def random_crop(al, dur):
     txt = [x[-1] for x in al]
-    align = [(i, float(x[0])) for i, x in enumerate(al) ]
+    align = [(i, float(x[0])) for i, x in enumerate(al)]
     idx, start = zip(*align)
     pos = min(len(start)-1, bisect.bisect_left(start, dur)+1)
     stop_idx = idx[pos]
@@ -122,7 +122,7 @@ class LinaDataModule(ptl.LightningDataModule):
             self,
             path,
             quant_layer,
-            codec_rate_hz=50,
+            codec_rate_hz=75,
             batch_size=None,
             token_by_batch=None,
             num_workers=8,
@@ -152,18 +152,14 @@ class LinaDataModule(ptl.LightningDataModule):
         self.dataset = load_dataset(self.path).with_format("torch").map(lambda x: {"len": x["audio_token"].shape[-1]}).filter(lambda x: x["align_token"] is not None and len(x["align_token"]) > 1)
 
         lens = self.dataset["train"]["len"].tolist()
-        maxl, minl = max(lens), min(lens)
-        if self.min_len is not None:
-            minl = self.min_len
-        if self.max_len is not None:
-            maxl = self.max_len
+        minl = self.min_len if self.min_len is not None else min(lens)
+        maxl = self.max_len if self.max_len is not None else max(lens)
         if self.n_buckets > 1:
             bound = np.linspace(minl, maxl+1, num=self.n_buckets+1, dtype=int)
             bound = [ int(x) for x in bound ]
             def get_bucket_num(sz):
                 lb = bound[:-1]
-                hb = [maxl]*self.n_buckets if self.random_crop else  bound[1:]
-                print(lb, hb)
+                hb = [maxl]*self.n_buckets if self.random_crop else bound[1:]
                 return [i for i, (low, high) in enumerate(zip(lb, hb)) if sz >= low and sz < high]
             buckets = defaultdict(lambda: [])
             for i, l in enumerate(lens):
