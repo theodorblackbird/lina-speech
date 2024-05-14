@@ -33,6 +33,7 @@ def delay_rvq(
         extended_code[i, :] = torch.roll(extended_code[i, :], i + 1)
 
     return extended_code.long()
+
 class BucketSampler(Sampler[List[int]]):
     def __init__(
             self,
@@ -43,6 +44,7 @@ class BucketSampler(Sampler[List[int]]):
             distributed: bool = True,  # TODO - implement not distributed as well
             sample_bucket: Optional[int] = None,
             seed: int = 123,
+            epoch_seed: bool = True,
             ):
         if type(batch_sizes) is int:
             batch_sizes = [batch_sizes] * len(buckets)
@@ -53,7 +55,6 @@ class BucketSampler(Sampler[List[int]]):
             assert len(bucket_sampling_weights) == len(batch_sizes)
         self.bucket_sampling_weights = bucket_sampling_weights
         self.buckets = buckets
-        print([len(b) for b in buckets])
         self.num_replicas = torch.distributed.get_world_size()
         self.rank = torch.distributed.get_rank()
         self.num_samples = [
@@ -67,6 +68,7 @@ class BucketSampler(Sampler[List[int]]):
         self.seed = seed
         self.epoch = 0
         self.sample_bucket = sample_bucket
+        self.epoch_seed = epoch_seed
         if self.sample_bucket is not None:
             self.total_sizes=[sample_bucket for bs in batch_sizes]
 
@@ -77,12 +79,12 @@ class BucketSampler(Sampler[List[int]]):
         return sum(self.total_sizes)
 
     def __iter__(self):
-        random.seed(self.seed + self.epoch)
+        random.seed(self.seed + self.epoch * self.epoch_seed)
         for b in self.buckets:
             random.shuffle(b)
         buckets = self.buckets
         if self.sample_bucket is not None:
-            buckets = [random.sample(b, bs*self.sample_bucket) for b, bs in zip(buckets, self.batch_sizes)]
+            buckets = [random.sample(b, bs*self.sample_bucket*self.num_replicas) for b, bs in zip(buckets, self.batch_sizes)]
         buckets = [b[self.rank :: self.num_replicas] for b in buckets]
         pool = [
                 BatchSampler(SubsetRandomSampler(b), bs, drop_last=self.drop_last)
@@ -127,6 +129,7 @@ class LinaDataModule(ptl.LightningDataModule):
             token_by_batch=None,
             num_workers=8,
             n_buckets=1,
+            test_size=2000,
             seed=123,
             random_crop=False,
             bucket_size=None,
@@ -146,17 +149,23 @@ class LinaDataModule(ptl.LightningDataModule):
         self.min_len = min_len
         self.max_len = max_len
         self.seed = seed
+        self.test_size = test_size
 
 
     def setup(self, stage):
         self.dataset = load_dataset(self.path).with_format("torch").map(lambda x: {"len": x["audio_token"].shape[-1]}).filter(lambda x: x["align_token"] is not None and len(x["align_token"]) > 1)
 
-        lens = self.dataset["train"]["len"].tolist()
-        minl = self.min_len if self.min_len is not None else min(lens)
-        maxl = self.max_len if self.max_len is not None else max(lens)
-        if self.n_buckets > 1:
-            bound = np.linspace(minl, maxl+1, num=self.n_buckets+1, dtype=int)
-            bound = [ int(x) for x in bound ]
+        self.dataset = self.dataset["train"].train_test_split(test_size=self.test_size)
+
+        train_lens, val_lens = map(lambda x: self.dataset[x]["len"].tolist(), ("train", "test"))
+        minl = self.min_len if self.min_len is not None else min(train_lens)
+        maxl = self.max_len if self.max_len is not None else max(train_lens)
+        bound = np.linspace(minl, maxl+1, num=self.n_buckets+1)
+        bound = [int(x) for x in bound]
+        self.batch_bound = defaultdict(lambda: [])
+        for lb, hb in zip(bound[:-1], bound[1:]):
+            self.batch_bound[self.token_by_batch//hb] = (lb, hb)
+        def get_buckets(lens):
             def get_bucket_num(sz):
                 lb = bound[:-1]
                 hb = [maxl]*self.n_buckets if self.random_crop else bound[1:]
@@ -166,23 +175,19 @@ class LinaDataModule(ptl.LightningDataModule):
                 for bn in get_bucket_num(l):
                     buckets[bn].append(i)
             buckets = [x for x in buckets.values()]
-            self.batch_bound = defaultdict(lambda: [])
-            for lb, hb in zip(bound[:-1], bound[1:]):
-                self.batch_bound[self.token_by_batch//hb] = (lb, hb)
-            batch_sizes = list(self.batch_bound.keys()) if self.token_by_batch is not None else self.batch_size
-            self.bound = bound
-            self.batch_sampler = BucketSampler(buckets, batch_sizes=batch_sizes, seed=self.seed, sample_bucket=self.bucket_size)
-        else:
-            self.batch_sampler = None
-
+            return buckets
+        batch_sizes = list(self.batch_bound.keys())
+        train_buckets, val_buckets = map(get_buckets, (train_lens, val_lens))
+        self.train_batch_sampler = BucketSampler(train_buckets, batch_sizes=batch_sizes, seed=self.seed, sample_bucket=self.bucket_size)
+        self.val_batch_sampler = BucketSampler(val_buckets, batch_sizes=batch_sizes, seed=self.seed, epoch_seed=False)
 
 
     def collate_fn(self, batch):
         audio_token = [x["audio_token"] for x in batch]
         text_token = [x["text_token"] for x in batch]
-        align_token = [x["align_token"] for x in batch]
 
         if self.random_crop:
+            align_token = [x["align_token"] for x in batch]
             lb, hb = self.batch_bound[len(batch)]
             cut = random.randint(lb, hb)/self.codec_rate_hz
             text_token, dur = zip(*[random_crop(al, cut) for al in align_token])
@@ -204,10 +209,18 @@ class LinaDataModule(ptl.LightningDataModule):
     def train_dataloader(self):
         return DataLoader(
                 self.dataset["train"],
-                batch_size=1
-                if self.n_buckets > 1
-                else self.batch_size,
+                batch_size=1,
                 num_workers=self.num_workers,
+                persistent_workers=True,
                 collate_fn=self.collate_fn,
-                batch_sampler=self.batch_sampler
+                batch_sampler=self.train_batch_sampler
+                )
+    def val_dataloader(self):
+        return DataLoader(
+                self.dataset["test"],
+                batch_size=1,
+                num_workers=self.num_workers,
+                persistent_workers=True,
+                collate_fn=self.collate_fn,
+                batch_sampler=self.val_batch_sampler
                 )
