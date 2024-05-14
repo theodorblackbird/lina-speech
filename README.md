@@ -56,7 +56,7 @@ Download configuration and weights above, then check `Inference.ipynb`.
 ```
 ### IRCAM
 
-This work is performed in the [Analysis/Synthesis team of the STMS Laboratory](https://www.stms-lab.fr/team/analyse-et-synthese-des-sons/) at IRCAM, and is part of the following project: ANR Exovoices
+This work is performed in the [Analysis/Synthesis team of the STMS Laboratory](https://www.stms-lab.fr/team/analyse-et-synthese-des-sons/) at IRCAM, and is part of the following project: 
 [ANR Exovoices](https://anr.fr/Projet-ANR-21-CE23-0040)
 
 <img align="left" width="150"  src="https://github.com/theodorblackbird/lina-speech/assets/1331899/7391b3c2-ec9a-431e-a090-f2ac5f55026b">
