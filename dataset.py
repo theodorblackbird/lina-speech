@@ -213,7 +213,7 @@ class LinaDataModule(ptl.LightningDataModule):
                 num_workers=self.num_workers,
                 persistent_workers=True,
                 collate_fn=self.collate_fn,
-                batch_sampler=self.train_batch_sampler
+                batch_sampler=self.train_batch_sampler if self.token_by_batch is not None else None,
                 )
     def val_dataloader(self):
         return DataLoader(
@@ -222,5 +222,5 @@ class LinaDataModule(ptl.LightningDataModule):
                 num_workers=self.num_workers,
                 persistent_workers=True,
                 collate_fn=self.collate_fn,
-                batch_sampler=self.val_batch_sampler
+                batch_sampler=self.val_batch_sampler if self.token_by_batch is not None else None,
                 )

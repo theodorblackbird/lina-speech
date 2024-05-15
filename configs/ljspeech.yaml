@@ -27,7 +27,7 @@ trainer:
 data:
   class_path: dataset.LinaDataModule
   init_args:
-    path: "ljspeech_encodec_vax_tokenize"
+    path: "theodorr/ljspeech"
     batch_size: 32
     quant_layer: [0, 1]
 
