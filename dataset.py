@@ -162,24 +162,25 @@ class LinaDataModule(ptl.LightningDataModule):
         maxl = self.max_len if self.max_len is not None else max(train_lens)
         bound = np.linspace(minl, maxl+1, num=self.n_buckets+1)
         bound = [int(x) for x in bound]
-        self.batch_bound = defaultdict(lambda: [])
-        for lb, hb in zip(bound[:-1], bound[1:]):
-            self.batch_bound[self.token_by_batch//hb] = (lb, hb)
-        def get_buckets(lens):
-            def get_bucket_num(sz):
-                lb = bound[:-1]
-                hb = [maxl]*self.n_buckets if self.random_crop else bound[1:]
-                return [i for i, (low, high) in enumerate(zip(lb, hb)) if sz >= low and sz < high]
-            buckets = defaultdict(lambda: [])
-            for i, l in enumerate(lens):
-                for bn in get_bucket_num(l):
-                    buckets[bn].append(i)
-            buckets = [x for x in buckets.values()]
-            return buckets
-        batch_sizes = list(self.batch_bound.keys())
-        train_buckets, val_buckets = map(get_buckets, (train_lens, val_lens))
-        self.train_batch_sampler = BucketSampler(train_buckets, batch_sizes=batch_sizes, seed=self.seed, sample_bucket=self.bucket_size)
-        self.val_batch_sampler = BucketSampler(val_buckets, batch_sizes=batch_sizes, seed=self.seed, epoch_seed=False)
+        self.batch_bound = defaultdict(lambda: (minl, maxl))
+        if self.token_by_batch is not None:
+            for lb, hb in zip(bound[:-1], bound[1:]):
+                self.batch_bound[self.token_by_batch//hb] = (lb, hb)
+            def get_buckets(lens):
+                def get_bucket_num(sz):
+                    lb = bound[:-1]
+                    hb = [maxl]*self.n_buckets if self.random_crop else bound[1:]
+                    return [i for i, (low, high) in enumerate(zip(lb, hb)) if sz >= low and sz < high]
+                buckets = defaultdict(lambda: [])
+                for i, l in enumerate(lens):
+                    for bn in get_bucket_num(l):
+                        buckets[bn].append(i)
+                buckets = [x for x in buckets.values()]
+                return buckets
+            batch_sizes = list(self.batch_bound.keys())
+            train_buckets, val_buckets = map(get_buckets, (train_lens, val_lens))
+            self.train_batch_sampler = BucketSampler(train_buckets, batch_sizes=batch_sizes, seed=self.seed, sample_bucket=self.bucket_size)
+            self.val_batch_sampler = BucketSampler(val_buckets, batch_sizes=batch_sizes, seed=self.seed, epoch_seed=False)
 
 
     def collate_fn(self, batch):
@@ -209,18 +210,16 @@ class LinaDataModule(ptl.LightningDataModule):
     def train_dataloader(self):
         return DataLoader(
                 self.dataset["train"],
-                batch_size=1,
+                batch_size=1 if self.token_by_batch is not None else self.batch_size,
                 num_workers=self.num_workers,
-                persistent_workers=True,
                 collate_fn=self.collate_fn,
                 batch_sampler=self.train_batch_sampler if self.token_by_batch is not None else None,
                 )
     def val_dataloader(self):
         return DataLoader(
                 self.dataset["test"],
-                batch_size=1,
+                batch_size=1 if self.token_by_batch is not None else self.batch_size,
                 num_workers=self.num_workers,
-                persistent_workers=True,
                 collate_fn=self.collate_fn,
                 batch_sampler=self.val_batch_sampler if self.token_by_batch is not None else None,
                 )
