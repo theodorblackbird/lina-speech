@@ -1,3 +1,9 @@
+# Lina-Speech: Gated Linear Attention is a Fast and Parameter-Efficient Learner for text-to-speech synthesis
+https://arxiv.org/abs/2410.23320
+Théodor Lemerle, Harrison Vanderbyl, Vaibhav Srivastav, Nicolas Obin, Axel Roebel.
+
+Code and checkpoints incoming...
+
 # lina-speech (beta)
 
 Exploring "linear attention" for text-to-speech.
