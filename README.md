@@ -3,14 +3,46 @@
 
 ### Authors: Théodor Lemerle, Harrison Vanderbyl, Vaibhav Srivastav, Nicolas Obin, Axel Roebel.
 
+Lina-Speech is a neural codec language model that provides state-of-the-art performances on zero-shot TTS. It replaces self-attention with some flavor of linear attention, we believe it is a sound choice for audio.
+We propose: 
+- **Voice cloning** with short samples by prompt continuation.
+- **High-throughput** : batch inference can go really high at no cost on a consumer grade GPU.
+- **Initial-State Tuning** (s/o [RWKV](https://github.com/BlinkDL/RWKV-LM)): fast speaker adaptation by tuning a recurrent state. Save your context window from long prompt !
+
+
+### Environment setup
+```
+conda create -n lina python=3.10
+conda activate lina
+
+pip install torch==2.5.1
+pip install causal-conv1d==1.3.0.post1
+pip install -r requirements.txt
+
+git submodule add https://github.com/sustcsonglin/flash-linear-attention.git 3rdparty/flash-linear-attention
+ln -s 3rdparty/flash-linear-attention/fla fla
+ln -s 3rdparty/encoder encoder
+ln -s 3rdparty/decoder decoder
+
+cd 3rdparty/flash-linear-attention
+git checkout 739ef15f97cff06366c97dfdf346f2ceaadf05ce
+```
+### Checkpoints
+#### WavTokenizer
+You will need this checkpoint of WavTokenizer **and the config file** : [[WavTokenizer-ckpt]](https://huggingface.co/novateur/WavTokenizer-medium-speech-75token/blob/main/wavtokenizer_medium_speech_320_24k.ckpt) [[config file]](https://huggingface.co/novateur/WavTokenizer-medium-speech-75token/resolve/main/wavtokenizer_mediumdata_frame75_3s_nq1_code4096_dim512_kmeans200_attn.yaml)
+
+#### Lina-Speech
+Dataset: LibriTTS + LibriTTS-R + MLS-english split (10k hours) + GigaSpeech XL:
+
+169M parameters version trained for 100B tokens: [[Lina-Speech 169M]](https://huggingface.co/lina-speech/all-models/tree/main/lina_gla_gigaspeech_d1024l12_convblind_shortconv_lr2e-4
+)
+
+### Inference
+See ```InferenceLina.ipynb``` and complete the first cells with the correct checkpoints and config paths.
 
 https://github.com/user-attachments/assets/624288be-73cc-4734-b08e-95792006c7b3
 
 https://github.com/user-attachments/assets/5dde6d53-89a9-4ae3-af46-ae1db3178a11
-
-
-Code and checkpoints incoming...
-
 
 ### Acknowledgments
 
