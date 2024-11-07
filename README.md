@@ -1,69 +1,73 @@
 # Lina-Speech: Gated Linear Attention is a Fast and Parameter-Efficient Learner for text-to-speech synthesis
-https://arxiv.org/abs/2410.23320
-Théodor Lemerle, Harrison Vanderbyl, Vaibhav Srivastav, Nicolas Obin, Axel Roebel.
+[[Paper]](https://arxiv.org/abs/2410.23320) [[Audio samples]](https://theodorblackbird.github.io/blog/demo_lina/)
 
-Code and checkpoints incoming...
+### Authors: Théodor Lemerle, Harrison Vanderbyl, Vaibhav Srivastav, Nicolas Obin, Axel Roebel.
 
-# lina-speech (beta)
+Lina-Speech is a neural codec language model that provides state-of-the-art performances on zero-shot TTS. It replaces self-attention with some flavor of linear attention, we believe it is a sound choice for audio.
+We propose: 
+- **Voice cloning** with short samples by prompt continuation.
+- **High-throughput** : batch inference can go really high at no cost on a consumer grade GPU.
+- **Initial-State Tuning** (s/o [RWKV](https://github.com/BlinkDL/RWKV-LM)): fast speaker adaptation by tuning a recurrent state. Save your context window from long prompt !
 
-Exploring "linear attention" for text-to-speech.
 
-It predicts audio codec "à la" [MusicGen](https://arxiv.org/abs/2306.05284) : delayed residual vector quantizers so that we do not need multiple models.
+### Environment setup
+```
+conda create -n lina python=3.10
+conda activate lina
 
-Featuring [RWKV](https://github.com/BlinkDL/RWKV-LM), [Mamba](https://github.com/state-spaces/mamba), [Gated Linear Attention](https://github.com/sustcsonglin/flash-linear-attention).
+pip install torch==2.5.1
+pip install causal-conv1d==1.3.0.post1
+pip install -r requirements.txt
 
-Compared to other LM TTS model :
-- Can be easily pretrained and finetuned on midrange GPUs.
-- Tiny memory footprint.
-- Trained on long context (up to 2000 tokens : ~27s).
+git submodule add https://github.com/sustcsonglin/flash-linear-attention.git 3rdparty/flash-linear-attention
+ln -s 3rdparty/flash-linear-attention/fla fla
+ln -s 3rdparty/encoder encoder
+ln -s 3rdparty/decoder decoder
 
-### Models
+cd 3rdparty/flash-linear-attention
+git checkout 739ef15f97cff06366c97dfdf346f2ceaadf05ce
+```
+### Checkpoints
+#### WavTokenizer
+You will need this checkpoint of WavTokenizer **and the config file** : [[WavTokenizer-ckpt]](https://huggingface.co/novateur/WavTokenizer-medium-speech-75token/blob/main/wavtokenizer_medium_speech_320_24k.ckpt) [[config file]](https://huggingface.co/novateur/WavTokenizer-medium-speech-75token/resolve/main/wavtokenizer_mediumdata_frame75_3s_nq1_code4096_dim512_kmeans200_attn.yaml)
 
-| Model | #Params | Dataset | Checkpoint | Steps | Note |
-| :---: | :---: |:---: |:---: |:---: |:---: |
-| GLA | 60M, 130M | Librilight-medium | [Download](https://huggingface.co/lina-speech/all-models/tree/main) | 300k | GPU inference only |
-| Mamba| 60M | Librilight-medium |[Download](https://huggingface.co/lina-speech/all-models/tree/main)| 300k | GPU inference only |
-| RWKV v6 | 60M | LibriTTS |[Download](https://huggingface.co/lina-speech/all-models/tree/main) | 150k | GPU inference only |
+#### Lina-Speech
+Dataset: LibriTTS + LibriTTS-R + MLS-english split (10k hours) + GigaSpeech XL:
 
-### Installation
-Following the linear complexity LM you choose, follow respective instructions first:
-- For Mamba check the [official repo](https://github.com/state-spaces/mamba).
-- For GLA/RWKV inference check [flash-linear-attention](https://github.com/sustcsonglin/flash-linear-attention).
-- For RWKV training check [RWKV-LM](https://github.com/BlinkDL/RWKV-LM)
+169M parameters version trained for 100B tokens: [[Lina-Speech 169M]](https://huggingface.co/lina-speech/all-models/tree/main/lina_gla_gigaspeech_d1024l12_convblind_shortconv_lr2e-4
+)
 
 ### Inference
+See ```InferenceLina.ipynb``` and complete the first cells with the correct checkpoints and config paths.
 
-Download configuration and weights above, then check `Inference.ipynb`.
+https://github.com/user-attachments/assets/624288be-73cc-4734-b08e-95792006c7b3
 
-### TODO
+https://github.com/user-attachments/assets/5dde6d53-89a9-4ae3-af46-ae1db3178a11
 
-- [x] Fix RWKV6 inference and/or switch to FLA implem.
-- [ ] Provide a Datamodule for training (_lhotse_ might also work well).
-- [ ] Implement CFG.
-- [ ] Scale up.
+### Acknowledgments
 
-### Acknowledgment
-
-- The RWKV authors and the community around for carrying high-level truly opensource research.
-- @SmerkyG for making my life easy at testing cutting edge language model.
-- @lucidrains for its huge codebase.
-- @sustcsonglin who made [GLA and FLA](https://github.com/sustcsonglin/flash-linear-attention).
-- @harrisonvanderbyl fixing RWKV inference.
+- The RWKV authors and the community for carrying high-level truly open-source research.
+- @SmerkyG for making our life easy at testing cutting edge language model.
+- To the [GLA/flash-linear-attention](https://github.com/sustcsonglin/flash-linear-attention) authors for their outstanding work.
+- To the [WavTokenizer](https://github.com/jishengpeng/WavTokenizer) authors for releasing such a brilliant speech codec.
+- 🤗 for supporting this project.
 
 ### Cite
 ```bib
-@software{lemerle2024linaspeech,
-  title  = {LinaSpeech: Exploring "linear attention" for text-to-speech.},
-  author = {Lemerle, Théodor},
-  url    = {https://github.com/theodorblackbird/lina-speech},
-  month  = april,
-  year   = {2024}
+@misc{lemerle2024linaspeechgatedlinearattention,
+      title={Lina-Speech: Gated Linear Attention is a Fast and Parameter-Efficient Learner for text-to-speech synthesis}, 
+      author={Théodor Lemerle and Harrison Vanderbyl and Vaibhav Srivastav and Nicolas Obin and Axel Roebel},
+      year={2024},
+      eprint={2410.23320},
+      archivePrefix={arXiv},
+      primaryClass={eess.AS},
+      url={https://arxiv.org/abs/2410.23320}, 
 }
 ```
 ### IRCAM
 
-This work is performed in the [Analysis/Synthesis team of the STMS Laboratory](https://www.stms-lab.fr/team/analyse-et-synthese-des-sons/) at IRCAM, and is part of the following project: 
-[ANR Exovoices](https://anr.fr/Projet-ANR-21-CE23-0040)
+This work has been initiated in the [Analysis/Synthesis team of the STMS Laboratory](https://www.stms-lab.fr/team/analyse-et-synthese-des-sons/) at IRCAM, and has been funded by the following project:
+- [ANR Exovoices](https://anr.fr/Projet-ANR-21-CE23-0040)
 
 <img align="left" width="150"  src="https://github.com/theodorblackbird/lina-speech/assets/1331899/7391b3c2-ec9a-431e-a090-f2ac5f55026b">
 <img align="left" width="150"  src="logo_ircam.jpeg">
