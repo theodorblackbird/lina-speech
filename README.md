@@ -4,7 +4,7 @@
 ### Authors: Théodor Lemerle, Harrison Vanderbyl, Vaibhav Srivastav, Nicolas Obin, Axel Roebel.
 
 Lina-Speech is a neural codec language model that provides state-of-the-art performances on zero-shot TTS. It replaces self-attention with some flavor of linear attention, we believe it is a sound choice for audio.
-We propose: 
+It features: 
 - **Voice cloning** with short samples by prompt continuation.
 - **High-throughput** : batch inference can go really high at no cost on a consumer grade GPU.
 - **Initial-State Tuning** (s/o [RWKV](https://github.com/BlinkDL/RWKV-LM)): fast speaker adaptation by tuning a recurrent state. Save your context window from long prompt !
