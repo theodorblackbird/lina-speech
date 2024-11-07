@@ -13,5 +13,5 @@ class AttentiveRNN(torch.nn.Module):
         pass
 
     @abstractmethod
-    def step(self, x, ctx, x_mask=None, y_mask=None):
+    def step(self, x, ctx, crossatt_mask):
         pass

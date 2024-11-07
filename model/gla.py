@@ -1,23 +1,37 @@
 from __future__ import annotations
 import torch
 import torch.nn as nn
+import os
+
 import torch.nn.functional as F
-from einops import rearrange
+from einops import rearrange, repeat, einsum
 from collections import defaultdict
 
 from model.attentive_rnn import AttentiveRNN
-from model.crossatt import CrossAttention, BlindCrossAttention
+from model.crossatt import CrossAttention, BlindCrossAttention, CrossAttentionPP
 from model.base_blocks import MixingBlock, SwiGLU
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 
 from fla.modules import FusedRMSNormSwishGate, RMSNorm, ShortConvolution
 from fla.ops.gla import chunk_gla, fused_chunk_gla, fused_recurrent_gla
+from fla.ops.gla.naive import naive_recurrent_gla
+from fla.ops.simple_gla import chunk_simple_gla
+from fla.models.utils import Cache
 
 
+if "GRAD_CKPT" in os.environ:
+    def maybe_grad_ckpt(f):
+        def grad_ckpt_f(*args, **kwargs):
+            return torch.utils.checkpoint.checkpoint(f, *args, **kwargs, use_reentrant=False)
+        return grad_ckpt_f
+else:
+    def maybe_grad_ckpt(f):
+        return f
+# pyright: basic
 #############
 # this part is adapted from https://github.com/sustcsonglin/flash-linear-attention/blob/main/fla/layers/gla.py#L20
 
@@ -30,25 +44,25 @@ from fla.ops.gla import chunk_gla, fused_chunk_gla, fused_recurrent_gla
 class GatedLinearAttention(nn.Module):
 
     def __init__(
-        self,
-        mode: str = 'fused_chunk',
-        hidden_size: int = 1024,
-        expand_k: float = 1.0,
-        expand_v: float = 2.0,
-        num_heads: int = 4,
-        use_short_conv: bool = False,
-        conv_size: int = 4,
-        conv_bias: bool = False,
-        share_conv_kernel: bool = True,
-        gate_fn: str = 'swish',
-        layernorm_eps: float = 1e-5,
-        gate_logit_normalizer: int = 16,
-        gate_low_rank_dim: int = 16,
-        clamp_min: Optional[float] = None,
-        fuse_norm: bool = True,
-        layer_idx: int = None,
-        **kwargs
-    ) -> GatedLinearAttention:
+            self,
+            mode: str = 'fused_chunk',
+            hidden_size: int = 1024,
+            expand_k: float = 1.0,
+            expand_v: float = 2.0,
+            num_heads: int = 4,
+            use_short_conv: bool = False,
+            conv_size: int = 4,
+            conv_bias: bool = False,
+            share_conv_kernel: bool = False,
+            gate_fn: str = 'swish',
+            layernorm_eps: float = 1e-5,
+            gate_logit_normalizer: int = 16,
+            gate_low_rank_dim: int = 16,
+            clamp_min: Optional[float] = None,
+            fuse_norm: bool = True,
+            layer_idx: int = None,
+            **kwargs
+            ) -> GatedLinearAttention:
         super().__init__()
 
         self.mode = mode
@@ -67,7 +81,7 @@ class GatedLinearAttention(nn.Module):
         self.clamp_min = clamp_min
         self.layer_idx = layer_idx
 
-        assert mode in ['chunk', 'fused_recurrent', 'fused_chunk'], f"Not suppoerted mode `{mode}`."
+        assert mode in ['chunk', 'fused_recurrent', 'fused_chunk', 'naive'], f"Not suppoerted mode `{mode}`."
         assert self.key_dim % num_heads == 0, f"key dim must be divisible by num_heads of {num_heads}"
         assert self.value_dim % num_heads == 0, f"value dim must be divisible by num_heads of {num_heads}"
 
@@ -81,7 +95,17 @@ class GatedLinearAttention(nn.Module):
 
         self.gk_proj = nn.Sequential(nn.Linear(hidden_size, gate_low_rank_dim, bias=False),
                                      nn.Linear(gate_low_rank_dim, self.key_dim, bias=True))
+        #self.gk_proj = nn.Linear(hidden_size, self.num_heads)
         self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
+
+        if use_short_conv:
+            self.conv_size = conv_size
+            if share_conv_kernel:
+                self.h_conv1d = ShortConvolution(hidden_size, conv_size, activation='silu')
+            else:
+                self.q_conv1d = ShortConvolution(self.key_dim, conv_size, activation='silu')
+                self.k_conv1d = ShortConvolution(self.key_dim, conv_size, activation='silu')
+                self.v_conv1d = ShortConvolution(self.value_dim, conv_size, activation='silu')
 
         if gate_fn == 'swish' and fuse_norm:
             self.g_norm_swish_gate = FusedRMSNormSwishGate(self.head_v_dim, eps=layernorm_eps)
@@ -105,20 +129,21 @@ class GatedLinearAttention(nn.Module):
         module._is_hf_initialized = True
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Cache] = None,
-        use_cache: Optional[bool] = False,
-        output_attentions: Optional[bool] = False,
-        **kwargs
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
+            self,
+            hidden_states: torch.Tensor,
+            reset_mask: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            reset_val: float = -20,
+            past_key_values: Optional[Cache] = None,
+            use_cache: Optional[bool] = False,
+            output_attentions: Optional[bool] = False,
+            **kwargs
+            ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
         # launching the triton kernel for just one token will actually be slower
         mode = self.mode
 
         last_state = past_key_values[self.layer_idx] if use_cache else None
-        #if self.use_short_conv:
-        if False:
+        if self.use_short_conv:
             conv_state = last_state[0] if use_cache else None
             if self.share_conv_kernel:
                 # conv state is updated inplace
@@ -144,13 +169,20 @@ class GatedLinearAttention(nn.Module):
         # dealing with left-padding
         if attention_mask is not None:
             v = v.mul_(attention_mask.unsqueeze(-1))
+
         q, k, v = map(lambda x: rearrange(x, 'b l (h d) -> b h l d', h=self.num_heads), (q, k, v))
         gk = rearrange(self.gk_proj(hidden_states), 'b n (h d) -> b h n d', h=self.num_heads)
+        #gk = rearrange(self.gk_proj(hidden_states), 'b l h -> b h l')
         gk = F.logsigmoid(gk) / self.gate_logit_normalizer
+
 
         if self.clamp_min is not None:
             gk = torch.clamp_min(gk, self.clamp_min)
 
+        if reset_mask is not None:
+            gk = gk.masked_fill(reset_mask.unsqueeze(1).unsqueeze(3), reset_val)
+            #gk = gk.masked_fill(reset_mask, -1e38)
+        
         recurrent_state = last_state[-1] if use_cache else None
         if mode == 'fused_recurrent':
             o, recurrent_state = fused_recurrent_gla(q, k, v, gk, initial_state=recurrent_state, output_final_state=use_cache)
@@ -161,10 +193,16 @@ class GatedLinearAttention(nn.Module):
             o, recurrent_state = fused_chunk_gla(q, k, v, gk, initial_state=recurrent_state, output_final_state=use_cache)
         elif mode == 'chunk':
             o, recurrent_state = chunk_gla(q, k, v, gk, initial_state=recurrent_state, output_final_state=use_cache)
+        elif mode == 'naive':
+            o, recurrent_state = naive_recurrent_gla(q, k, v, gk, initial_state=self.state, output_final_state=use_cache)
+        elif mode == 'init_state_tuning':
+            bs = q.shape[0]
+            initial_state=repeat(self.state, "1 ... -> bs ...", bs=bs)
+            o, recurrent_state = fused_recurrent_gla(q, k, v, gk, initial_state=initial_state, output_final_state=True)
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
 
-        if past_key_values is not None:
+        if past_key_values is not None and not self.training:
             if self.use_short_conv:
                 if self.share_conv_kernel:
                     last_state = (conv_state, recurrent_state)
@@ -210,184 +248,230 @@ class GatedLinearAttention(nn.Module):
 
 ########
 
-def exists(x):
-    return x is not None
-
-
 
 class AttentiveGLA(AttentiveRNN):
     def __init__(
-        self,
-        d_model: int,
-        n_layer: int,
-        d_context: int,
-        heads: int,
-        dropout_att: float=0.0,
-        dropout: float=0.,
-        d_blind: int=None,
-        blind: bool =False,
-    ):
+            self,
+            d_model: int,
+            n_layer: int,
+            heads: int,
+            dropout_att: float=0.0,
+            dropout: float=0.,
+            d_blind: int=None,
+            blind: bool =False,
+            cross_att_pp: bool=False,
+            rotary: bool =False,
+            use_short_conv: bool=False,
+            expand_k: float=1.,
+            expand_v: float=2.,
+            pos_type="sinusoidal",
+            ):
         super().__init__()
+        block = lambda d, h, i: MixingBlock(lambda: GatedLinearAttention(hidden_size=d, num_heads=h, use_short_conv=use_short_conv, expand_k=expand_k, expand_v=expand_v, layer_idx=i),
+                                         lambda: SwiGLU(d),
+                                         lambda: nn.LayerNorm(d),
+                                         dropout=dropout,
+                                         )
+        self.encoder = nn.ModuleList([block(d_model, heads, i) for i in range(n_layer)])
+        self.decoder = nn.ModuleList([block(d_model, heads, i) for i in range(n_layer, 2*n_layer)])
         if d_blind is None:
             d_blind=d_model
-        block = lambda d, h: MixingBlock(lambda: GatedLinearAttention(hidden_size=d, num_heads=h),
-                                                   lambda: SwiGLU(d),
-                                                   lambda: nn.LayerNorm(d),
-                                                    dropout=dropout,
-                                                   )
-        self.encoder = nn.Sequential(*[block(d_model, heads) for i in range(n_layer)])
-        self.decoder = nn.Sequential(*[block(d_model, heads) for i in range(n_layer)])
-        self.cross_att = (
-            BlindCrossAttention(
-                d_model, d_context, d_model, 1, block(d_blind, heads), dropout_att, pos_dim=d_blind
-            )
-            if blind
-            else CrossAttention(d_model, d_context, d_model, heads, dropout_att)
-        )
 
-    def forward(self, x, ctx, x_mask=None, ctx_mask=None):
-        if exists(x_mask) and exists(ctx_mask):
-            mask = rearrange(x_mask, "b i -> b i 1") * rearrange(
-                ctx_mask, "b j -> b 1 j"
-            )
-            mask = rearrange(mask, "b i j -> b 1 i j")
+        if blind:
+            self.cross_att = BlindCrossAttention(d_model, d_model, d_model, 1, block(d_blind, heads, 2*n_layer), dropout_att, pos_dim=d_blind, rotary=rotary, pos_type=pos_type)
+        elif cross_att_pp:
+            self.cross_att = CrossAttentionPP(d_model, block(d_model, heads), 1,ca_dropout=dropout_att)
         else:
-            mask = None
+            self.cross_att = CrossAttention(d_model, d_model, d_model, heads, dropout_att)
 
-        y = torch.utils.checkpoint.checkpoint_sequential(self.encoder, len(self.encoder), x, use_reentrant=False)
-        #y = self.encoder(x)
-        v, att = self.cross_att(y, ctx, mask=mask)
-        y = torch.utils.checkpoint.checkpoint_sequential(self.decoder, len(self.decoder), y + v, use_reentrant=False)
-        #y = self.decoder(y + v)
+    def forward(self, x, ctx, mask=None, pos=None, reset_mask=None, attention_only=None, forced_attention=None, init_state=None, crossatt_pos=None):
+        
+        for e in self.encoder:
+            if self.training:
+                e = maybe_grad_ckpt(e)
+            x = e(x, use_cache=init_state is not None, past_key_values=init_state)
 
-        return y, att
+        v, att = self.cross_att(x, ctx, mask=mask, reset_mask=reset_mask, pos=crossatt_pos)
+        x = x + v
+        for d in self.decoder:
+            if self.training:
+                d = maybe_grad_ckpt(d)
+            x = d(x, use_cache=init_state is not None, past_key_values=init_state)
+        return x, att
 
-    def init_state(self, max_seqlen=1000):
-        for be, bd in zip(self.encoder, self.decoder):
-            be.tmix.mode, bd.tmix.mode = 'inference', 'inference'
-            be.tmix.state, bd.tmix.state = None, None
-            be.tmix.use_short_conv = False
-            bd.tmix.use_short_conv = False
-        self.cross_att.pos_net.tmix.mode = 'inference'
-        self.cross_att.pos_net.tmix.state = None
-        self.cross_att.pos_net.tmix.use_short_conv = False
+    def init_state(self, max_seqlen=1000, batch_size=16):
+        cache = Cache()
+        for i, e in enumerate(self.encoder):
+            cache.update(e.tmix.init_state(batch_size), i, offset=0)
+            
+        for i, d in enumerate(self.decoder):
+            cache.update(d.tmix.init_state(batch_size), i + len(self.encoder), offset=0)
 
-    def step(self, y_embd, x_enc, time_step):
-        y_embd = self.encoder(y_embd)
-        v, att = self.cross_att(y_embd, x_enc, time_step=time_step)
+        if hasattr(self.cross_att, "pos_net"):
+            cache.update(d.tmix.init_state(batch_size), len(self.decoder) + len(self.encoder), offset=0)
+        
+        return cache
+
+    def get_state_from_params(self, params, batch_size, scale=0.02):
+        cache = self.init_state(batch_size=batch_size)
+        for i, x in enumerate(params):
+            if len(x) == 2:
+                state = einsum(*x, "b r h k vv, b r h kk v -> b h k v")*scale
+            else:
+                state = x[0]
+            state = repeat(state, "1 ... -> bs ...", bs=batch_size).clone()
+            cache.states[i] = cache.states[i][:-1] + (state,)
+            
+        return cache
+
+    def to_mode(self, mode):
+        for b in self.encoder:
+            b.tmix.mode = mode
+        for b in self.decoder:
+            b.tmix.mode = mode
+        if hasattr(self.cross_att, "pos_net"):
+            self.cross_att.pos_net.mode = mode
+        
+
+    def get_init_state_tuning_params(self, lora: Optional[int]=None, scale: float=0.02, device=None):
+        parameters = []
+        def produce_params(h, k, v, lora:Optional[int]=None):
+            if lora is not None:
+                k = nn.Parameter(torch.randn(1, lora, h, k, 1, device=device))
+                v = nn.Parameter(torch.randn(1, lora, h, 1, v, device=device)*scale)
+                return k, v
+            else:
+                return nn.Parameter(torch.randn(1, h, k, v, device=device)*scale)
+
+        for b in self.encoder:
+            b = b.tmix
+            k, v, h = b.head_qk_dim, b.head_v_dim, b.num_heads
+            parameters.append(produce_params(h, k, v, lora=lora))
+
+        for b in self.decoder:
+            b = b.tmix
+            k, v, h = b.head_qk_dim, b.head_v_dim, b.num_heads
+            parameters.append(produce_params(h, k, v, lora=lora))
+        
+        return parameters
+
+    def step(self, y_embd, x_enc, time_step, cache):
+        for e in self.encoder:
+            y_embd = e(y_embd, past_key_values=cache, use_cache=True)
+        v, att = self.cross_att(y_embd, x_enc, time_step=time_step, past_key_values=cache, use_cache=True)
         y_embd = y_embd + v
-        y_embd = self.decoder(y_embd)
-        return y_embd, att
+        for d in self.decoder:
+            y_embd = d(y_embd, past_key_values=cache, use_cache=True)
+        return y_embd, att, cache
 
 class CrossAttGLA(AttentiveRNN):
     def __init__(
-        self,
-        d_model,
-        n_layer,
-        d_context,
-        heads,
-        dropout_att=0.0,
-        blind=False,
-    ):
+            self,
+            d_model: int,
+            n_layer: int,
+            cross_att_layers: list[int],
+            heads: int,
+            cross_att_heads: int,
+            dropout_att: float=0.0,
+            dropout: float=0.,
+            rotary: bool =False,
+            use_short_conv: bool=False,
+            expand_k: float=1.,
+            expand_v: float=2.,
+
+            ):
         super().__init__()
-        block = lambda d, h: MixingBlock(lambda: GatedLinearAttention(d_model=d, num_head=h),
-                                                   lambda: SwiGLU(d),
-                                                   lambda: nn.LayerNorm(d),
-                                                   )
-        self.blocks = nn.ModuleList([block(d_model, heads) for i in range(n_layer)])
-        self.cross_att = nn.ModuleList([CrossAttention(d_model, d_context, d_model, heads, dropout_att) for i in range(2)])
-        self.cross_att_layers = list(range(n_layer//2, n_layer//2 + 2))
-        self.n_layer = n_layer
+        block = lambda d, h, i: MixingBlock(lambda: GatedLinearAttention(hidden_size=d, num_heads=h, use_short_conv=use_short_conv, expand_k=expand_k, expand_v=expand_v, layer_idx=i),
+                                         lambda: SwiGLU(d),
+                                         lambda: nn.LayerNorm(d),
+                                         dropout=dropout,
+                                         )
 
-    def forward(self, x, ctx, x_mask=None, ctx_mask=None):
-        if exists(x_mask) and exists(ctx_mask):
-            mask = rearrange(x_mask, "b i -> b i 1") * rearrange(
-                ctx_mask, "b j -> b 1 j"
-            )
-            mask = rearrange(mask, "b i j -> b 1 i j")
-        else:
-            mask = None
+        self.blocks = nn.ModuleList([block(d_model, heads, i) for i in range(n_layer)])
+        self.cross_att = nn.ModuleList([CrossAttention(d_model, d_model, d_model, cross_att_heads, dropout=dropout_att, rotary=rotary) for _ in cross_att_layers])
+        self.cross_att_layers = cross_att_layers
+
+    def forward(self, x, ctx, mask=None, pos=None, reset_mask=None, attention_only=None, forced_attention=None, init_state=None, **kwargs):
         y = x
+        idx = {k: v for v, k in enumerate(self.cross_att_layers)}
+        att = None
         for i, b in enumerate(self.blocks):
-            y = torch.utils.checkpoint.checkpoint(b, y, use_reentrant=False)
+            if self.training:
+                b = maybe_grad_ckpt(b)
+            y = b(y)
             if i in self.cross_att_layers:
-                v, att = self.cross_att[i - self.n_layer//2](y, ctx, mask=mask)
+                v, att = self.cross_att[idx[i]](y, ctx, mask=mask.unsqueeze(1))
                 y = y + v
-
         return y, att
 
     def init_state(self, max_seqlen=1000):
         for b in self.blocks:
-            b.att.state = None
-            b.att.mode = "inference"
-#            be.att.state, bd.att.state = None, None
-#        self.cross_att.pos_net.att.mode = 'inference'
-#        self.cross_att.pos_net.att.state = None
-#
+            b.tmix.state = None
+            b.tmix.mode = "inference"
+
     def step(self, y, ctx, time_step):
         atts = []
         for i, b in enumerate(self.blocks):
             y = b(y)
             if i in self.cross_att_layers:
-                v, att = self.cross_att[i - self.n_layer//2](y, ctx, time_step=time_step)
+                v, att = self.cross_att[i - self.cross_att_layers[0]](y, ctx, time_step=time_step)
                 atts.append(att)
                 y = y + v
         return y, torch.cat(atts, dim=1)
 
-class MixedAttGLA(AttentiveRNN):
+class CrossAttGLAV2(AttentiveRNN):
     def __init__(
-        self,
-        d_model,
-        n_layer,
-        d_context,
-        heads,
-        d_blind=64,
-        dropout_att=0.0,
-    ):
+            self,
+            n_layer,
+            crossatt_layers: List[int],
+            d_model,
+            n_heads,
+            crossatt_heads: int = 2,
+            dropout_att: float = 0.1,
+            rotary: bool = False,
+            ):
         super().__init__()
-        block = lambda d, h: MixingBlock(lambda: GatedLinearAttention(d_model=d, num_head=h),
-                                                   lambda: SwiGLU(d),
-                                                   lambda: nn.LayerNorm(d),
-                                                   )
-        self.blocks = nn.ModuleList([block(d_model, heads) for i in range(n_layer)])
-        self.cross_att = nn.ModuleList([
-            CrossAttention(d_model, d_context, d_model, heads, dropout_att),
-            BlindCrossAttention(d_model, d_context, d_model, 1, block(d_blind, 1), dropout_att),
-            ])
-        self.cross_att_layers = list(range(n_layer//2, n_layer//2 + 2))
+
+
+        block = lambda: MixingBlock(lambda: GatedLinearAttention(hidden_size=d_model, num_heads=n_heads),
+                                         lambda: SwiGLU(d_model),
+                                         lambda: nn.LayerNorm(d_model),
+                                         )
+        self.blocks = nn.ModuleList([block() for i in range(n_layer)])
+        self.cross_att = nn.ModuleDict({str(i): CrossAttention(d_model, d_model, d_model, crossatt_heads, dropout=dropout_att, rotary=rotary) for i in crossatt_layers})
+        self.crossatt_layers = crossatt_layers
         self.n_layer = n_layer
 
-    def forward(self, x, ctx, x_mask=None, ctx_mask=None):
-        if exists(x_mask) and exists(ctx_mask):
-            mask = rearrange(x_mask, "b i -> b i 1") * rearrange(
-                ctx_mask, "b j -> b 1 j"
-            )
-            mask = rearrange(mask, "b i j -> b 1 i j")
-        else:
-            mask = None
+    def forward(self, x, ctx, mask=None, pos=None, **kwargs):
         y = x
+        att = None
         for i, b in enumerate(self.blocks):
             y = torch.utils.checkpoint.checkpoint(b, y, use_reentrant=False)
-            if i in self.cross_att_layers:
-                v, att = self.cross_att[i - self.n_layer//2](y, ctx, mask=mask)
+            if i in self.crossatt_layers:
+                v, _att = self.cross_att[str(i)](y, ctx, mask=mask.unsqueeze(1))
                 y = y + v
-
+                if _att is not None:
+                    if att is not None:
+                        att = torch.cat((att, _att), dim=1)
+                    else:
+                        att = _att
         return y, att
 
-    def init_state(self, max_seqlen=1000):
-        for b in self.blocks:
-            b.att.state = None
-            b.att.mode = "inference"
-#            be.att.state, bd.att.state = None, None
-        self.cross_att[1].pos_net.att.mode = 'inference'
-        self.cross_att[1].pos_net.att.state = None
-#
+    def init_state(self, max_seqlen=1000, state=None):
+        if state is None:
+            state = defaultdict(lambda: None)
+        for i, b in enumerate(self.blocks):
+            b.tmix.state = state[i]
+            b.tmix.mode = "inference"
+
+
+
     def step(self, y, ctx, time_step):
         atts = []
         for i, b in enumerate(self.blocks):
             y = b(y)
-            if i in self.cross_att_layers:
-                v, att = self.cross_att[i - self.n_layer//2](y, ctx, time_step=time_step)
+            if i in self.crossatt_layers:
+                v, att = self.cross_att[str(i)](y, ctx, time_step=time_step)
                 atts.append(att)
                 y = y + v
         return y, torch.cat(atts, dim=1)

@@ -1,8 +1,38 @@
 from typing import Callable, List, Optional
+from itertools import accumulate
 
 import torch
 
 default_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def pad_2d_sequence(seq, padding_value=0):
+    max_x, max_y = map(max, zip(*map(lambda x: x.shape, seq)))
+    pad = lambda x: torch.nn.functional.pad(
+        x,
+        (0, max_y - x.shape[1], 0, max_x - x.shape[0]),
+        value=padding_value,
+    )
+    return torch.stack([pad(x) for x in seq])
+
+def packmask_2d(xlen: list[int], ylen: list[int], offset: int=0) -> torch.Tensor:
+    _, ybound = map(lambda x: [0] + list(accumulate(x, int.__add__)), (xlen, ylen))
+    lb, hb = [], []
+
+    for n, l, h in zip(xlen, ybound[:-1], ybound[1:]):
+        lb += [l]*n
+        hb += [h]*n
+
+    lb, hb = map(torch.tensor, (lb, hb))
+    if offset:
+        lb -= offset
+        hb += offset
+
+    rge = torch.arange(ybound[-1])
+
+    lm = rge.unsqueeze(0) >= lb.unsqueeze(1)
+    hm = rge.unsqueeze(0) < hb.unsqueeze(1)
+
+    return lm * hm
 
 
 def topk_sampling(seq, k=1, temp=1.):
@@ -28,7 +58,6 @@ def delay_rvq(
 
     return extended_code.long()
 
-
 def undelay_rvq(extended_code):
     q, _, n = extended_code.shape
     out = []
@@ -36,19 +65,6 @@ def undelay_rvq(extended_code):
         out.append(torch.roll(extended_code[i], -(i + 1), dims=1))
     out = torch.stack(out, dim=0)
     return out[:, :, :-(q+1)]
-
-def to_vocos(x):
-    x = undelay_rvq(x.T)
-    x = (x - 3).clamp_min(0)
-    return x
-
-def txt_to_phon(x):
-    return espeak.phonemize([x], strip=True, njobs=1)[0]
-    
-def phon_to_code(x):
-    y = [ds.vocab_x_code[t] for t in x]
-    y = [ds.vocab_x_code["BOS"]] + y + [ds.vocab_x_code["EOS"]]
-    return torch.tensor(y)
 
 def sequence_mask(lengths, max_len=None, device=default_device):
     batch_size = lengths.shape[0]
@@ -59,34 +75,3 @@ def sequence_mask(lengths, max_len=None, device=default_device):
     mask = ids < lengths.unsqueeze(1).expand(-1, max_len)
 
     return mask
-
-
-def convert_pad_shape(pad_shape):
-    l = pad_shape[::-1]
-    pad_shape = [item for sublist in l for item in sublist]
-    return pad_shape
-
-
-def align_mask(src_mask, mel_mask):
-    align_mask = torch.zeros(
-        src_mask.shape[0], src_mask.shape[-1], mel_mask.shape[-1], dtype=torch.bool
-    )
-    for i, (src, mel) in enumerate(zip(src_mask, mel_mask)):
-        w = torch.max(src.sum(-1))
-        l = torch.max(mel.sum(-1))
-        align_mask[i, :w, :l] = torch.ones(w, l, dtype=torch.bool)
-    return align_mask
-
-
-def last_that_fullfil(cond: Callable, x: torch.Tensor, strict: bool = True):
-    res = cond(x).nonzero()
-    if strict:
-        assert len(res), f"no one fullfill {cond}"
-    return res[-1]
-
-
-def first_that_fullfil(cond: Callable, x: torch.Tensor, strict: bool = True):
-    res = cond(x).nonzero()
-    if strict:
-        assert len(res), f"no one fullfill {cond}"
-    return res[0]

@@ -3,23 +3,39 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Callable
 from einops import rearrange
-from rotary_embedding_torch import RotaryEmbedding
+from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
+
 
 class SelfAttention(nn.Module):
-    def __init__(self, dim, heads, rotary=True):
+    def __init__(self, dim, heads, rotary=True, is_causal=False):
         super().__init__()
         self.qkv = nn.Linear(dim, 3*dim)
         assert dim % heads == 0
         self.heads = heads
         self.rotary = RotaryEmbedding((dim // heads) // 2) if rotary else None
-    def forward(self, x, mask=None):
+        self.is_causal = is_causal
+
+    def forward(self, x, mask=None, pos=None, cache=None, layer_idx=None, time_step=0):
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q, k, v = map(
             lambda x: rearrange(x, "b n (h d) -> b h n d", h=self.heads), (q, k, v)
         )
+        
+        if cache is not None:
+            assert layer_idx is not None
+            cache.update(k, v, layer_idx=layer_idx)
+            k, v = cache[layer_idx]
+
         if self.rotary is not None:
-            q, k = map(self.rotary.rotate_queries_or_keys, (q, k))
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+            if pos is not None:
+                q, k = map(lambda x: apply_rotary_emb(self.rotary(pos).unsqueeze(1), x), (q, k))
+            else:
+                #q, k = map(lambda x: self.rotary.rotate_queries_or_keys(x, offset=time_step), (q, k))
+                q = self.rotary.rotate_queries_or_keys(q, offset=time_step)
+                k = self.rotary.rotate_queries_or_keys(k)
+
+
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=self.is_causal)
         y = rearrange(y, "b h n d -> b n (h d)")
         return y
 
@@ -38,7 +54,7 @@ def unpack_ignore(x):
     return x[0] if type(x) is tuple else x
 
 class MixingBlock(torch.nn.Module):
-    def __init__(self, tmix: Callable, cmix: Callable, norm: Callable, dropout=0.):
+    def __init__(self, tmix: Callable, cmix: Callable, norm: Callable, dropout: float=0.):
         super().__init__()
         self.tmix = tmix()
         self.cmix = cmix()
