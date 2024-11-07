@@ -3,6 +3,12 @@
 
 ### Authors: Théodor Lemerle, Harrison Vanderbyl, Vaibhav Srivastav, Nicolas Obin, Axel Roebel.
 
+
+https://github.com/user-attachments/assets/624288be-73cc-4734-b08e-95792006c7b3
+
+https://github.com/user-attachments/assets/5dde6d53-89a9-4ae3-af46-ae1db3178a11
+
+
 Code and checkpoints incoming...
 
 
