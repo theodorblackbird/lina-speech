@@ -3,7 +3,7 @@
 
 ### Authors: Théodor Lemerle, Harrison Vanderbyl, Vaibhav Srivastav, Nicolas Obin, Axel Roebel.
 
-Lina-Speech is a neural codec language model that provides state-of-the-art performances on zero-shot TTS. It replaces self-attention with some flavor of linear attention, we believe it is a sound choice for audio.
+Lina-Speech is a neural codec language model that provides state-of-the-art performances on zero-shot TTS. It replaces self-attention with [Gated Linear Attention](https://arxiv.org/abs/2312.06635), we believe it is a sound choice for audio.
 It features: 
 - **Voice cloning** with short samples by prompt continuation.
 - **High-throughput** : batch inference can go high at no cost on a consumer grade GPU.
