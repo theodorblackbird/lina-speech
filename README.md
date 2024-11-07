@@ -16,7 +16,8 @@ Code and checkpoints incoming...
 
 - The RWKV authors and the community for carrying high-level truly open-source research.
 - @SmerkyG for making our life easy at testing cutting edge language model.
-- To the GLA/flash-linear-attention authors for their outstanding work [GLA and FLA](https://github.com/sustcsonglin/flash-linear-attention).
+- To the [GLA/flash-linear-attention](https://github.com/sustcsonglin/flash-linear-attention) authors for their outstanding work.
+- To the [WavTokenizer](https://github.com/jishengpeng/WavTokenizer) authors for releasing such a brilliant speech codec.
 - 🤗 for supporting this project.
 
 ### Cite
