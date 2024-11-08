@@ -64,6 +64,9 @@ https://github.com/user-attachments/assets/5dde6d53-89a9-4ae3-af46-ae1db3178a11
       url={https://arxiv.org/abs/2410.23320}, 
 }
 ```
+### Disclaimer
+Any organization or individual is prohibited from using any technology mentioned in this paper to generate or edit someone's speech without his/her consent, including but not limited to government leaders, political figures, and celebrities. If you do not comply with this item, you could be in violation of copyright laws.
+
 ### IRCAM
 
 This work has been initiated in the [Analysis/Synthesis team of the STMS Laboratory](https://www.stms-lab.fr/team/analyse-et-synthese-des-sons/) at IRCAM, and has been funded by the following project:
