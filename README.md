@@ -7,7 +7,7 @@ Lina-Speech is a neural codec language model that provides state-of-the-art perf
 It features: 
 - **Voice cloning** with short samples by prompt continuation.
 - **High-throughput** : batch inference can go high at no cost on a consumer grade GPU.
-- **Initial-State Tuning** (s/o [RWKV](https://github.com/BlinkDL/RWKV-LM)): fast speaker adaptation by tuning a recurrent state. Save your context window from long prompt !
+- **Initial-State Tuning** (s/o [RWKV](https://github.com/BlinkDL/RWKV-LM) + fast implem by [FLA](https://github.com/sustcsonglin/flash-linear-attention)): fast speaker adaptation by tuning a recurrent state. Save your context window from long prompt !
 
 
 ### Environment setup
