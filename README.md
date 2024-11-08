@@ -19,7 +19,6 @@ pip install torch==2.5.1
 pip install causal-conv1d==1.3.0.post1
 pip install -r requirements.txt
 
-git submodule add https://github.com/sustcsonglin/flash-linear-attention.git 3rdparty/flash-linear-attention
 ln -s 3rdparty/flash-linear-attention/fla fla
 ln -s 3rdparty/encoder encoder
 ln -s 3rdparty/decoder decoder
